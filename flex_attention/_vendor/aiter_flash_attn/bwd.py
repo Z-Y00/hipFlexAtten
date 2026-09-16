@@ -11,6 +11,7 @@ from .utils import (
     AutotuneMode,
     get_arch,
     is_fp8,
+    max_block_for_lds,
     remap_xcd,
 )
 
@@ -4840,6 +4841,39 @@ def attention_backward_triton_impl(
             dropout_mask.stride()
         )
 
+    # flex_attention addition (Phase 4 / MLA): same 64 KiB LDS cap as the forward, but
+    # here the dominant tiles are sized by BLOCK_N1 (dK/dV) and BLOCK_M2 (dQ). AITER's
+    # tuned configs use 128 for both, which overflows once padded_d_model_qk >= 512.
+    # See fwd_prefill.attention_forward_prefill_triton_impl for why this bypasses the
+    # autotuner rather than pruning its config list.
+    cap_block = max_block_for_lds(padded_d_model_qk, q.element_size())
+    tuned_block = max(
+        (
+            max(c.kwargs.get("BLOCK_N1", 0), c.kwargs.get("BLOCK_M2", 0))
+            for c in (noncausal_autotune_configs + causal_autotune_configs)
+        ),
+        default=0,
+    )
+    if cap_block < tuned_block:
+        if cap_block == 0:
+            raise ValueError(
+                f"head_dim {head_size_qk} (padded to {padded_d_model_qk}) is too large for "
+                f"this GPU's LDS budget in the backward kernel"
+            )
+        bwd_block_overrides = dict(
+            BLOCK_M1=min(32, cap_block),
+            BLOCK_N1=cap_block,
+            BLOCK_M2=cap_block,
+            BLOCK_N2=min(64, cap_block),
+            BLK_SLICE_FACTOR=2,
+            waves_per_eu=1,
+            matrix_instr_nonkdim=16,
+            num_stages=1,
+            num_warps=4,
+        )
+    else:
+        bwd_block_overrides = {}
+
     # Choose which kernels to call based on mode
     if mode == "fused":
         seqlen = max(max_seqlen_q, max_seqlen_k)
@@ -4847,18 +4881,35 @@ def attention_backward_triton_impl(
         arch = get_arch()
         num_xcd = 1 if arch.is_rdna else 8
 
-        def grid(META):
-            return (
-                nheads_k,
-                ((seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"]),
-                batch,
-            )
+        if bwd_block_overrides:
+            fixed_block_n1 = bwd_block_overrides["BLOCK_N1"]
+
+            def grid(META):
+                return (
+                    nheads_k,
+                    ((seqlen + fixed_block_n1 - 1) // fixed_block_n1),
+                    batch,
+                )
+
+        else:
+
+            def grid(META):
+                return (
+                    nheads_k,
+                    ((seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"]),
+                    batch,
+                )
 
         if causal:
 
             if DEBUG_TRITON:
                 print(f"bwd_kernel: grid = {grid}")
-            bwd_kernel_fused_causal[grid](
+            causal_launcher = (
+                bwd_kernel_fused_causal.fn[grid]
+                if bwd_block_overrides
+                else bwd_kernel_fused_causal[grid]
+            )
+            causal_launcher(
                 q,
                 k,
                 v,
@@ -4947,9 +4998,15 @@ def attention_backward_triton_impl(
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
                 NUM_XCD=num_xcd,
+                **bwd_block_overrides,
             )
         else:
-            bwd_kernel_fused_noncausal[grid](
+            noncausal_launcher = (
+                bwd_kernel_fused_noncausal.fn[grid]
+                if bwd_block_overrides
+                else bwd_kernel_fused_noncausal[grid]
+            )
+            noncausal_launcher(
                 q,
                 k,
                 v,
@@ -5041,6 +5098,7 @@ def attention_backward_triton_impl(
                 SCORE_MOD=score_mod,
                 MASK_MOD=mask_mod,
                 SCORE_MOD_BWD=score_mod_bwd,
+                **bwd_block_overrides,
             )
     elif mode == "fused_atomic":
         NUM_WARPS, NUM_STAGES = 4, 1

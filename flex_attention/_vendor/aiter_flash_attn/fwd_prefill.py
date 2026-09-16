@@ -17,6 +17,7 @@ from .utils import (
     AutotuneMode,
     get_arch,
     is_fp8,
+    max_block_for_lds,
     remap_xcd,
 )
 
@@ -1896,7 +1897,36 @@ def attention_forward_prefill_triton_impl(
     def grid(META):
         return (nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]), batch)
 
-    attn_fwd[grid](
+    # flex_attention addition (Phase 4 / MLA): AITER's tuned configs use BLOCK_M=128,
+    # whose Q tile overflows CDNA3's 64 KiB LDS once padded_d_model_qk >= 512. Rather
+    # than filter the autotuner's config list (triton only runs early_config_prune when
+    # more than one config is present, so that would silently miss AUTOTUNE=off), bypass
+    # the autotuner and launch the raw JITFunction with a block size that fits. Normal
+    # head dims never take this path, so the tuned fast path is untouched.
+    cap_block_m = max_block_for_lds(padded_d_model_qk, q.element_size())
+    tuned_block_m = max(
+        (c.kwargs.get("BLOCK_M", 0) for c in fwd_prefill_autotune_configs), default=0
+    )
+    if cap_block_m < tuned_block_m:
+        if cap_block_m == 0:
+            raise ValueError(
+                f"head_dim {head_size_qk} (padded to {padded_d_model_qk}) is too large for "
+                f"this GPU's LDS budget in the forward kernel"
+            )
+        launcher = attn_fwd.fn[grid]
+        block_overrides = dict(
+            BLOCK_M=cap_block_m,
+            BLOCK_N=min(64, cap_block_m),
+            waves_per_eu=2,
+            PRE_LOAD_V=False,
+            num_stages=1,
+            num_warps=4,
+        )
+    else:
+        launcher = attn_fwd[grid]
+        block_overrides = {}
+
+    launcher(
         q,
         k,
         v,
@@ -1975,4 +2005,5 @@ def attention_forward_prefill_triton_impl(
         HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
         SCORE_MOD=score_mod,
         MASK_MOD=mask_mod,
+        **block_overrides,
     )

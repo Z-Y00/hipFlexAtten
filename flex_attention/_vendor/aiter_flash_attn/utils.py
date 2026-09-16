@@ -117,6 +117,28 @@ class GpuArch:
 # -------------------------------
 # Global Variables
 # -------------------------------
+# --- flex_attention addition (Phase 4 / MLA), not upstream AITER ---------------
+# CDNA3 (gfx942) gives 64 KiB of LDS per workgroup. AITER's tuned configs assume
+# head_dim <= 256, where the Q tile always fits; MLA shapes (head_dim_v up to 512,
+# head_dim_qk up to 512) overflow it. Measured on MI300X, Triton's reported LDS
+# requirement for attn_fwd is exactly BLOCK_M * padded_head_dim_qk * elem_size
+# (131072 B for BLOCK_M=128, padded 512, bf16 -- and halving BLOCK_M made it fit),
+# and for the fused backward it is the same product with BLOCK_N1 / BLOCK_M2 in
+# place of BLOCK_M. So model the budget on that single dominant tile.
+LDS_LIMIT_BYTES = 64 * 1024
+
+
+def max_block_for_lds(padded_head_dim: int, elem_size: int) -> int:
+    """Largest power-of-two sequence-block that keeps the dominant tile inside LDS.
+
+    Returns 0 when even a block of 16 cannot fit, which the callers surface as a
+    clear "head_dim too large" error rather than a raw Triton OutOfResources.
+    """
+    raw = LDS_LIMIT_BYTES // max(padded_head_dim * elem_size, 1)
+    block = 1 << (raw.bit_length() - 1) if raw >= 1 else 0  # round down to pow2
+    return block if block >= 16 else 0
+
+
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 AUTOTUNE: AutotuneMode = (
     "on"

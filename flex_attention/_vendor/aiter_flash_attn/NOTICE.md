@@ -38,4 +38,28 @@ So `flex_attention/interface.py` always uses `mode="split"` when `causal=True`
 `causal=False`, where it's been verified correct. This should be re-checked against a
 newer aiter commit if/when this project updates its pinned version.
 
+**Second upstream limitation: the "split" backward assumes a single head dim.**
+`_bwd_kernel_split_*` and their inner helpers (`_bwd_dkdv_inner_split`,
+`_bwd_dq_inner_split`) carry one `BLOCK_D_MODEL` / `BLOCK_D_MODEL_POW2` pair, whereas
+the fused kernels correctly carry separate `HEAD_DIM_QK` / `HEAD_DIM_V`. So the split
+path cannot express `head_dim_qk != head_dim_v`: it indexes V with the QK head dim and
+reads past the end of the tensor. Observed as a HIP `illegal memory access` on MI300X
+for head_dim 192/128 -- and, worse, it is *latent*: the same call succeeds in isolation
+and only faults under a different allocator layout, so it can silently corrupt instead
+of erroring.
+
+Since causal and deterministic both route to the split path, `interface.py` rejects
+`head_dim_qk != head_dim_v` combined with either flag when gradients are required.
+Asymmetric head dims are fully supported in the forward, and in the backward with
+`causal=False, deterministic=False` (the fused path).
+
+**LDS capping (flex_attention change, not upstream).** MLA head dims overflow CDNA3's
+64 KiB LDS with AITER's tuned `BLOCK_M`/`BLOCK_N1`/`BLOCK_M2` of 128. Both wrappers now
+compute a head-dim-aware cap (`max_block_for_lds` in `utils.py`) and, when it binds,
+bypass the autotuner to launch the raw JITFunction with a block size that fits. The
+autotuner is bypassed rather than filtered because triton only calls
+`early_config_prune` when more than one config is present, which would silently miss
+AITER's `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0` mode. Ordinary head dims never hit this
+path, and the benchmark is unchanged.
+
 License: MIT (see LICENSE-aiter in this directory).

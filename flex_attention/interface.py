@@ -6,10 +6,18 @@ that recomputed QK^T twice per tile pair and benchmarked ~1.3-1.8x slower; see t
 NOTICE for details). See /home/lorri/.claude/plans/piped-painting-nebula.md for the
 overall port plan.
 
-Phase 1 scope: causal, varlen, GQA/MQA, sliding window, return_lse, forward+backward.
-Everything else in flash_attn.cute's signature (softcap, learnable_sink, score_mod,
-mask_mod, qv/gather_kv_indices, block_sparse_tensors) is explicitly NotImplementedError
-until its own phase lands.
+Supported: causal, varlen, GQA/MQA, sliding window, return_lse, forward+backward
+(Phase 1); score_mod / mask_mod / score_mod_bwd (Phase 3); MLA and other large or
+asymmetric head dims up to 576/512 (Phase 4). Still unsupported, each raising a clear
+NotImplementedError: softcap and learnable_sink (Phase 2), qv / gather_kv_indices
+(top-k sparse KV), and block_sparse_tensors (Phase 5).
+
+Several feature *combinations* are also rejected rather than silently computing the
+wrong thing, all traceable to two upstream AITER limitations documented in
+_vendor/aiter_flash_attn/NOTICE.md: its fused causal backward is numerically wrong, and
+its split backward assumes a single head dim. Since causal/deterministic route to the
+split path, that means no backward for causal+window, causal+score_mod/mask_mod, or
+causal/deterministic with head_dim_qk != head_dim_v.
 """
 
 from typing import Callable, Optional, Tuple
@@ -44,6 +52,9 @@ def _check_unsupported(
     causal,
     window_size,
     requires_grad,
+    head_dim_qk,
+    head_dim_v,
+    deterministic,
 ):
     if qv is not None:
         raise NotImplementedError("qv-packed input is not yet supported by the Triton/AMD backend")
@@ -59,6 +70,23 @@ def _check_unsupported(
         raise NotImplementedError("aux_tensors/aux_scalars are only used by score_mod/mask_mod, unsupported for now")
     if block_sparse_tensors is not None or block_sparse_tensors_bwd is not None:
         raise NotImplementedError("block_sparse_tensors is not yet supported by the Triton/AMD backend (Phase 5)")
+
+    # The backward routes to AITER's "split" kernels whenever causal or deterministic is
+    # set (its "fused" causal backward returns a wrong dK/dV at the pinned commit). Those
+    # split kernels carry a single BLOCK_D_MODEL rather than separate QK/V head dims, so
+    # they cannot express head_dim_qk != head_dim_v -- doing so reads past the end of V
+    # and faults (or silently corrupts) instead of erroring. Neither backward mode can
+    # serve this combination, so reject it rather than return garbage gradients.
+    if requires_grad and head_dim_qk != head_dim_v and (causal or deterministic):
+        raise NotImplementedError(
+            f"backward with head_dim_qk != head_dim_v ({head_dim_qk} != {head_dim_v}) "
+            f"is not supported together with causal=True or deterministic=True: AITER's "
+            f"split backward assumes a single head dim, and its fused causal backward is "
+            f"numerically wrong at the pinned commit. Use causal=False "
+            f"(a causal mask_mod is not a workaround here -- the restriction is on the "
+            f"backward kernel, not the mask). See "
+            f"flex_attention/_vendor/aiter_flash_attn/NOTICE.md."
+        )
 
     has_mod = score_mod is not None or mask_mod is not None
     if score_mod_bwd is not None and score_mod is None:
@@ -310,6 +338,9 @@ def flash_attn_func(
         window_size,
         requires_grad=torch.is_grad_enabled()
         and (q.requires_grad or k.requires_grad or v.requires_grad),
+        head_dim_qk=q.shape[-1],
+        head_dim_v=v.shape[-1],
+        deterministic=deterministic,
     )
     if num_splits != 1:
         raise NotImplementedError("num_splits != 1 is not yet supported by the Triton/AMD backend")
@@ -373,6 +404,9 @@ def flash_attn_varlen_func(
         window_size,
         requires_grad=torch.is_grad_enabled()
         and (q.requires_grad or k.requires_grad or v.requires_grad),
+        head_dim_qk=q.shape[-1],
+        head_dim_v=v.shape[-1],
+        deterministic=deterministic,
     )
     if num_splits != 1:
         raise NotImplementedError("num_splits != 1 is not yet supported by the Triton/AMD backend")
