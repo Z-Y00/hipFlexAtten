@@ -53,8 +53,6 @@ def _qkv(batch, seqlen, nheads_q, nheads_k, hd_qk, hd_v, dtype, device):
 @pytest.mark.parametrize("hd_qk,hd_v,_id", MLA_SHAPES, ids=[s[2] for s in MLA_SHAPES])
 @pytest.mark.parametrize("causal", [False, True])
 def test_mla_shapes_forward_backward(hd_qk, hd_v, _id, causal):
-    if causal and hd_qk != hd_v:
-        pytest.skip("causal backward needs AITER's split kernels, which assume one head dim")
     device = "cuda"
     dtype = torch.bfloat16
     batch, seqlen, nheads = 1, 256, 2
@@ -127,24 +125,25 @@ def test_head_dim_too_large_raises_cleanly():
 
 @needs_gpu
 @pytest.mark.parametrize("flag", ["causal", "deterministic"])
-def test_asymmetric_head_dim_backward_rejected(flag):
-    """causal/deterministic route to AITER's split backward, which has a single head dim.
+def test_asymmetric_head_dim_backward_supported(flag):
+    """Regression: causal/deterministic with head_dim_qk != head_dim_v.
 
-    It must refuse rather than read past the end of V (which faults or silently corrupts).
+    This used to route to AITER's split backward, which carries a single head dim and
+    read past the end of V (a latent fault that only tripped under some allocator
+    layouts). The backward now always uses the fused kernels, which carry separate QK/V
+    dims, so this must produce correct gradients.
     """
     device = "cuda"
     q, k, v = _qkv(1, 128, 2, 2, 192, 128, torch.bfloat16, device)
-    kwargs = {flag: True}
-    with pytest.raises(NotImplementedError, match="head_dim_qk"):
-        flash_attn_func(q, k, v, softmax_scale=192**-0.5, **kwargs)
-
-
-@needs_gpu
-@pytest.mark.parametrize("flag", ["causal", "deterministic"])
-def test_asymmetric_head_dim_forward_only_allowed(flag):
-    """The forward handles asymmetric head dims fine; only the backward is restricted."""
-    device = "cuda"
-    q, k, v = _qkv(1, 128, 2, 2, 192, 128, torch.bfloat16, device)
-    with torch.no_grad():
-        out = flash_attn_func(q, k, v, softmax_scale=192**-0.5, **{flag: True})
-    assert out.shape == (1, 128, 2, 128)
+    qr, kr, vr = [t.detach().clone().requires_grad_() for t in (q, k, v)]
+    scale = 192**-0.5
+    out = flash_attn_func(q, k, v, softmax_scale=scale, **{flag: True})
+    ref = ref_attention(qr, kr, vr, scale, causal=(flag == "causal"))
+    do = torch.randn_like(out)
+    out.backward(do)
+    ref.backward(do)
+    for got, want, name in [(q, qr, "dq"), (k, kr, "dk"), (v, vr, "dv")]:
+        torch.testing.assert_close(
+            got.grad.float(), want.grad.float(), atol=1.5e-1, rtol=1.5e-1,
+            msg=lambda m, n=name: f"{n}: {m}",
+        )

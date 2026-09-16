@@ -759,12 +759,49 @@ def get_bwd_configs(mode: AutotuneMode):
         return (preprocess_configs, causal_configs, noncausal_configs)
 
 
+# flex_attention fix (not upstream AITER) -----------------------------------------
+# AITER's backward configs all set matrix_instr_nonkdim=16. On gfx942 that forces the
+# 16x16x16 MFMA, and the AMD Triton backend then miscompiles the accumulating
+# `tl.dot(..., acc=...)` in _bwd_dkdv_inner / _bwd_dq_inner when the dot's K dimension
+# is <= 16: every loop iteration except the last is silently dropped from dK/dV.
+#
+# Only the CAUSAL backward hits this, which is why the bug looked causal-specific: the
+# diagonal ("masked") blocks are swept with BLOCK_M1 // BLK_SLICE_FACTOR (32 // 2 = 16),
+# while the non-causal path uses the full BLOCK_M1 = 32 and is unaffected. Measured on
+# MI300X: with nonkdim=16 and a masked block of 16, only the final 16 key positions of
+# each K block get correct dV; setting nonkdim to 32, or dropping it so Triton picks the
+# instruction itself, makes every position correct. The same applies to the masked dQ
+# sweep, which uses BLOCK_N2 // BLK_SLICE_FACTOR.
+#
+# So drop the hint on any config whose masked sub-block would be <= 16. Configs whose
+# sub-blocks stay >= 32 keep it and their tuning.
+_MFMA_ACC_MIN_K = 32
+
+
+def _sanitize_nonkdim(configs):
+    for cfg in configs:
+        kw = cfg.kwargs
+        if "matrix_instr_nonkdim" not in kw:
+            continue
+        slice_factor = kw.get("BLK_SLICE_FACTOR", 1)
+        masked_dims = [
+            kw[name] // slice_factor for name in ("BLOCK_M1", "BLOCK_N2") if name in kw
+        ]
+        if masked_dims and min(masked_dims) < _MFMA_ACC_MIN_K:
+            del kw["matrix_instr_nonkdim"]
+    return configs
+
+
 # os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 (
     preprocess_autotune_configs,
     causal_autotune_configs,
     noncausal_autotune_configs,
 ) = get_bwd_configs(AUTOTUNE)
+# Causal only: the non-causal kernel sweeps with the full BLOCK_M1 / BLOCK_N2 (there are
+# no diagonal blocks to slice), so its dots never hit the small-K miscompile and it keeps
+# the tuning hint. Applying this to both cost ~5% on non-causal for no correctness gain.
+causal_autotune_configs = _sanitize_nonkdim(causal_autotune_configs)
 
 
 @triton.jit
@@ -3450,6 +3487,9 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
+    SCORE_MOD: tl.constexpr = None,
+    MASK_MOD: tl.constexpr = None,
+    SCORE_MOD_BWD: tl.constexpr = None,
 ):
     # program ids
     hkid = tl.program_id(0)
@@ -3671,6 +3711,11 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                off_z=bid,
+                off_h_q=hqid,
+                SCORE_MOD=SCORE_MOD,
+                MASK_MOD=MASK_MOD,
+                SCORE_MOD_BWD=SCORE_MOD_BWD,
             )
             start_m += num_steps * MASK_BLOCK_M1
             # The unmasked region runs from the diagonal to seqlen_q. With a
@@ -3744,6 +3789,11 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                off_z=bid,
+                off_h_q=hqid,
+                SCORE_MOD=SCORE_MOD,
+                MASK_MOD=MASK_MOD,
+                SCORE_MOD_BWD=SCORE_MOD_BWD,
             )
         # end of GQA/MQA of dkdv
         # Write back dV
@@ -3893,6 +3943,11 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                off_z=bid,
+                off_h_q=hqid,
+                SCORE_MOD=SCORE_MOD,
+                MASK_MOD=MASK_MOD,
+                SCORE_MOD_BWD=SCORE_MOD_BWD,
             )
             end_n -= num_steps * MASK_BLOCK_N2
             # The unmasked region runs from 0 up to the diagonal (end_n). With a
@@ -3965,6 +4020,11 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                off_z=bid,
+                off_h_q=hqid,
+                SCORE_MOD=SCORE_MOD,
+                MASK_MOD=MASK_MOD,
+                SCORE_MOD_BWD=SCORE_MOD_BWD,
             )
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
@@ -4732,16 +4792,13 @@ def attention_backward_triton_impl(
             "Sliding-window backward is currently implemented for fused mode only."
         )
 
-    # score_mod/mask_mod are only threaded through the non-causal fused kernel
-    # (bwd_kernel_fused_noncausal -> _bwd_dkdv_inner / _bwd_dq_inner). The causal
-    # fused kernel is broken at this pinned commit and the "split" kernels use a
-    # separate pair of inner helpers that were not instrumented. Callers express
-    # causality as a mask_mod instead -- see flex_attention/interface.py.
+    # score_mod/mask_mod are threaded through both fused kernels (causal and non-causal)
+    # via _bwd_dkdv_inner / _bwd_dq_inner. The "split" and "fused_atomic" kernels use a
+    # different pair of inner helpers that were not instrumented.
     has_mod = score_mod is not None or mask_mod is not None or score_mod_bwd is not None
-    if has_mod and (mode != "fused" or causal):
+    if has_mod and mode != "fused":
         raise NotImplementedError(
-            "score_mod/mask_mod backward requires the non-causal fused path "
-            f"(got mode={mode!r}, causal={causal}). Express causality as a mask_mod."
+            f"score_mod/mask_mod backward requires the fused path (got mode={mode!r})."
         )
     # Either edge may be unbounded and is handled uniformly (mirroring the forward
     # kernels): WINDOW_SIZE_LEFT < 0 lets keys reach back to 0 / queries have no
@@ -4867,7 +4924,8 @@ def attention_backward_triton_impl(
             BLOCK_N2=min(64, cap_block),
             BLK_SLICE_FACTOR=2,
             waves_per_eu=1,
-            matrix_instr_nonkdim=16,
+            # deliberately no matrix_instr_nonkdim: these capped blocks halve to <= 16
+            # for the causal masked sweep, which miscompiles -- see _sanitize_nonkdim.
             num_stages=1,
             num_warps=4,
         )
@@ -4998,6 +5056,9 @@ def attention_backward_triton_impl(
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
                 NUM_XCD=num_xcd,
+                SCORE_MOD=score_mod,
+                MASK_MOD=mask_mod,
+                SCORE_MOD_BWD=score_mod_bwd,
                 **bwd_block_overrides,
             )
         else:

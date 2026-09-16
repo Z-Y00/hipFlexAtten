@@ -23,12 +23,6 @@ def _rand_qkv(batch, seqlen_q, seqlen_k, nheads_q, nheads_k, head_dim, dtype, de
 @pytest.mark.parametrize("gqa_ratio", [1, 4])
 @pytest.mark.parametrize("window_size", [(None, None), (128, 0)])
 def test_dense_forward_backward(dtype, causal, gqa_ratio, window_size):
-    # causal + window backward has no working AITER mode at the pinned commit -- see
-    # NOTICE.md and the NotImplementedError this raises; covered by
-    # test_causal_window_backward_unsupported instead.
-    if causal and window_size != (None, None):
-        pytest.skip("causal+window backward unsupported at the pinned aiter commit")
-
     device = "cuda"
     batch, seqlen, head_dim = 2, 384, 64
     nheads_k = 4
@@ -53,12 +47,20 @@ def test_dense_forward_backward(dtype, causal, gqa_ratio, window_size):
 
 
 @needs_gpu
-def test_causal_window_backward_unsupported():
+def test_backward_is_deterministic():
+    """The backward always uses AITER's non-atomic fused kernels, so repeated runs must
+    be bitwise identical regardless of the `deterministic` flag."""
     device = "cuda"
-    q, k, v = _rand_qkv(2, 128, 128, 4, 4, 64, torch.float16, device)
-    out = flash_attn_func(q, k, v, causal=True, window_size=(64, 0))
-    with pytest.raises(NotImplementedError):
+    grads = []
+    for _ in range(3):
+        q, k, v = _rand_qkv(2, 512, 512, 8, 8, 64, torch.float16, device)
+        out = flash_attn_func(q, k, v, causal=True)
+        torch.manual_seed(1234)
         out.backward(torch.randn_like(out))
+        grads.append((q.grad.clone(), k.grad.clone(), v.grad.clone()))
+    for i in range(3):
+        for j in (1, 2):
+            assert torch.equal(grads[0][i], grads[j][i]), "backward is not deterministic"
 
 
 @needs_gpu

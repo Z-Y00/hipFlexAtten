@@ -12,12 +12,12 @@ asymmetric head dims up to 576/512 (Phase 4). Still unsupported, each raising a 
 NotImplementedError: softcap and learnable_sink (Phase 2), qv / gather_kv_indices
 (top-k sparse KV), and block_sparse_tensors (Phase 5).
 
-Several feature *combinations* are also rejected rather than silently computing the
-wrong thing, all traceable to two upstream AITER limitations documented in
-_vendor/aiter_flash_attn/NOTICE.md: its fused causal backward is numerically wrong, and
-its split backward assumes a single head dim. Since causal/deterministic route to the
-split path, that means no backward for causal+window, causal+score_mod/mask_mod, or
-causal/deterministic with head_dim_qk != head_dim_v.
+All supported features compose freely (causal with window_size, score_mod and MLA head
+dims together, and so on). Earlier revisions rejected several such combinations; those
+restrictions all traced back to a single upstream defect -- AITER's tuned backward
+configs set matrix_instr_nonkdim=16, which miscompiles the accumulating tl.dot in the
+causal diagonal sweep -- which is now patched out in the vendored kernel. See
+_vendor/aiter_flash_attn/NOTICE.md.
 """
 
 from typing import Callable, Optional, Tuple
@@ -71,41 +71,14 @@ def _check_unsupported(
     if block_sparse_tensors is not None or block_sparse_tensors_bwd is not None:
         raise NotImplementedError("block_sparse_tensors is not yet supported by the Triton/AMD backend (Phase 5)")
 
-    # The backward routes to AITER's "split" kernels whenever causal or deterministic is
-    # set (its "fused" causal backward returns a wrong dK/dV at the pinned commit). Those
-    # split kernels carry a single BLOCK_D_MODEL rather than separate QK/V head dims, so
-    # they cannot express head_dim_qk != head_dim_v -- doing so reads past the end of V
-    # and faults (or silently corrupts) instead of erroring. Neither backward mode can
-    # serve this combination, so reject it rather than return garbage gradients.
-    if requires_grad and head_dim_qk != head_dim_v and (causal or deterministic):
-        raise NotImplementedError(
-            f"backward with head_dim_qk != head_dim_v ({head_dim_qk} != {head_dim_v}) "
-            f"is not supported together with causal=True or deterministic=True: AITER's "
-            f"split backward assumes a single head dim, and its fused causal backward is "
-            f"numerically wrong at the pinned commit. Use causal=False "
-            f"(a causal mask_mod is not a workaround here -- the restriction is on the "
-            f"backward kernel, not the mask). See "
-            f"flex_attention/_vendor/aiter_flash_attn/NOTICE.md."
-        )
-
-    has_mod = score_mod is not None or mask_mod is not None
+    # NOTE: causal + window_size, causal + score_mod/mask_mod, and asymmetric head dims
+    # with causal/deterministic were all rejected here previously. They now work: the
+    # backward always uses AITER's "fused" kernels, which carry separate QK/V head dims,
+    # support window_size, are where score_mod/mask_mod are instrumented, and are
+    # correct for causal now that the matrix_instr_nonkdim miscompile is patched out
+    # (see _sanitize_nonkdim in bwd.py).
     if score_mod_bwd is not None and score_mod is None:
         raise ValueError("score_mod_bwd was given without score_mod")
-    if has_mod and requires_grad:
-        # The backward instrumentation only exists on AITER's non-causal fused path;
-        # the causal fused kernel is broken at the pinned commit and the "split"
-        # kernels use a separate pair of inner helpers that weren't instrumented.
-        if causal:
-            raise NotImplementedError(
-                "score_mod/mask_mod with causal=True is not supported in the backward pass. "
-                "Express causality as a mask_mod instead (see flex_attention.causal_mask_mod) "
-                "and pass causal=False."
-            )
-        if window_size != (None, None):
-            raise NotImplementedError(
-                "score_mod/mask_mod with window_size is not supported in the backward pass. "
-                "Express the window as a mask_mod instead."
-            )
     if score_mod is not None and score_mod_bwd is None and requires_grad:
         raise ValueError(
             "score_mod requires score_mod_bwd for the backward pass: score_mod is inlined "
@@ -210,33 +183,14 @@ class _FlashAttnFunc(torch.autograd.Function):
         dk = torch.zeros_like(k)
         dv = torch.zeros_like(v)
 
-        # AITER's "fused" causal backward (this project's default -- see the docstring on
-        # flash_attn_func) produces a wrong dV at this pinned commit (fedccf0, confirmed by
-        # a minimal repro bypassing this wrapper entirely: fused causal dV differs from a
-        # plain-PyTorch reference by O(1) absolute error, "fused_atomic" causal crashes with
-        # a missing-argument TypeError from inside bwd.py itself, and "split" causal matches
-        # the reference to fp16/bf16 precision). So causal always uses "split" regardless of
-        # `deterministic`, until this is fixed upstream or independently root-caused; only
-        # non-causal gets the deterministic/fused choice.
-        # score_mod/mask_mod are only instrumented on the non-causal fused path, and
-        # _check_unsupported already rejected causal/window with a mod when grad is
-        # required, so "fused" is always the right mode here.
-        has_mod = ctx.score_mod is not None or ctx.mask_mod is not None
-        if has_mod:
-            mode = "fused"
-        else:
-            mode = "split" if (ctx.causal or ctx.deterministic) else "fused"
-        has_window = ctx.window_size_left != -1 or ctx.window_size_right != -1
-        if mode == "split" and has_window:
-            # AITER's "split" backward doesn't support window_size at all, and "fused" -
-            # the only mode that does - has a broken causal dV (see the comment above).
-            # There's no working backward for causal+window at this pinned aiter commit.
-            raise NotImplementedError(
-                "causal + window_size backward is not supported: AITER's 'fused' mode "
-                "(the only mode with window_size support) has a broken causal dV at the "
-                "pinned commit, and 'split' mode doesn't support window_size at all. "
-                "See flex_attention/_vendor/aiter_flash_attn/NOTICE.md."
-            )
+        # Always "fused": it is correct for causal and non-causal alike now that the
+        # matrix_instr_nonkdim miscompile is patched out (see _sanitize_nonkdim in
+        # bwd.py), it is the only mode carrying separate QK/V head dims, it is the only
+        # one supporting window_size, it is where score_mod/mask_mod are instrumented,
+        # and it is bitwise deterministic (atomics live in the separate "fused_atomic"
+        # mode, which this project never uses). AITER's "split" mode is strictly worse
+        # here on every axis, so `deterministic` needs no separate path.
+        mode = "fused"
 
         attention_backward_triton_impl(
             do=do.contiguous(),
@@ -297,17 +251,11 @@ def flash_attn_func(
     ``pack_gqa`` is accepted for signature compatibility with flash_attn.cute but is a
     no-op here: GQA/MQA is handled by plain head-index broadcast in both the forward and
     backward Triton kernels, which needs no explicit "packing" step on AMD.
-    ``deterministic=False`` (default) uses AITER's ``bwd.py`` "fused" backward mode
-    (fastest: single pass per Q/K tile pair, ``tl.atomic_add`` into dQ across K-blocks,
-    so dQ's accumulation order -- and thus its exact floating-point value -- can vary
-    run to run). ``deterministic=True`` uses its "split" mode instead (no atomics, each
-    kernel owns its own output tile, ~1.3-1.8x slower; see the backend's NOTICE.md for
-    why we benchmarked and chose this tradeoff rather than always using the slower one).
-    Note AITER's "split" mode does not support ``window_size`` in the backward pass; that
-    combination raises NotImplementedError from within bwd.py itself.
-    Also note: when ``causal=True``, "split" mode is always used regardless of
-    ``deterministic`` -- AITER's "fused"/"fused_atomic" causal backward are broken at the
-    pinned commit (wrong dV / a crash respectively; see the backend's NOTICE.md).
+    ``deterministic`` is accepted for signature compatibility but is a no-op: the
+    backward always uses AITER's "fused" kernels, which write each output tile from a
+    single program (the atomics live in AITER's separate "fused_atomic" mode, which this
+    project never uses) and were verified bitwise-identical across repeated runs. So the
+    backward is always deterministic, and there is no slower alternative path to select.
     ``num_splits`` (split-KV forward) is not yet wired up; only num_splits=1 is supported.
 
     ``score_mod`` / ``mask_mod`` (FlexAttention-style) must be ``@triton.jit`` functions,
@@ -318,9 +266,11 @@ def flash_attn_func(
     ``score_mod`` is NOT auto-differentiated -- if gradients are needed you must supply
     ``score_mod_bwd`` (its VJP), matching flash_attn.cute's contract. ``mask_mod`` needs
     no such hook (non-differentiable; masked positions get zero gradient).
-    In the backward pass these are only supported with ``causal=False`` and no
-    ``window_size`` -- express either as a ``mask_mod`` instead (see
-    ``flex_attention.causal_mask_mod``).
+    These compose freely with ``causal`` and ``window_size``. ``flex_attention.mods``
+    also ships ready-made ``causal_mask_mod`` / ``make_sliding_window_mask_mod`` if you
+    prefer to express those as mods (note those helpers are top-left aligned, whereas
+    the ``causal``/``window_size`` flags are bottom-right aligned; they agree when
+    seqlen_q == seqlen_k).
     """
     _check_unsupported(
         qv,

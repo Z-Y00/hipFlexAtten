@@ -1,11 +1,15 @@
 """Benchmark flex_attention (AITER fwd + AITER bwd) against AITER's own fwd+bwd
 (bench/_aiter_ref, an unmodified benchmark-only copy), on MI300/CDNA3.
 
-The AITER-side backward uses the same mode selection as flex_attention/interface.py
-(causal -> "split", non-causal -> "fused"), since AITER's "fused"/"fused_atomic" causal
-backward is broken at the pinned commit -- see
-flex_attention/_vendor/aiter_flash_attn/NOTICE.md. Comparing against anything else
-for causal shapes wouldn't be apples-to-apples.
+The baseline is AITER's *unpatched* vendored copy running its own default backward mode
+("fused") for both causal and non-causal.
+
+IMPORTANT CAVEAT for the causal rows: at the pinned commit AITER's fused causal backward
+is numerically wrong (it sets matrix_instr_nonkdim=16, which miscompiles the accumulating
+tl.dot over the diagonal blocks -- see flex_attention/_vendor/aiter_flash_attn/NOTICE.md).
+So on causal rows the baseline is computing an incorrect dK/dV. The causal comparison is
+therefore speed-only: it shows what the fix costs, not a correctness-matched baseline.
+The non-causal rows are a true apples-to-apples comparison.
 
 Usage: python3 -m bench.bench_mi300
 """
@@ -111,7 +115,7 @@ def bench_aiter(q, k, v, causal):
     out, lse, _, _ = fwd()
     do = torch.randn_like(out)
     batch, seqlen, nheads_q, _ = q.shape
-    mode = "split" if causal else "fused"
+    mode = "fused"  # AITER's own default; see the caveat in the module docstring
 
     def fwd_bwd():
         out, lse, _, _ = aiter_ref.fwd(**_aiter_fwd_kwargs(q, k, v, causal, scale))

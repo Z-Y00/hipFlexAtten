@@ -160,8 +160,38 @@ def test_score_mod_without_bwd_allowed_under_no_grad():
 
 
 @needs_gpu
-def test_mod_with_causal_flag_raises_when_grad_required():
+@pytest.mark.parametrize("window_size", [(None, None), (128, 0)])
+def test_mod_composes_with_causal_flag(window_size):
+    """Regression: score_mod/mask_mod combined with causal (and window) in the backward.
+
+    This used to be rejected because the causal backward routed to AITER's uninstrumented
+    split kernels. The backward now always uses the instrumented fused kernels.
+    """
     device = "cuda"
-    q, k, v = _rand_qkv(1, 64, 2, 2, 32, torch.float16, device)
-    with pytest.raises(NotImplementedError, match="causal"):
-        flash_attn_func(q, k, v, causal=True, mask_mod=causal_mask_mod)
+    batch, seqlen, head_dim, nheads = 2, 256, 64, 4
+    q, k, v = _rand_qkv(batch, seqlen, nheads, nheads, head_dim, torch.float16, device)
+    qr, kr, vr = [t.detach().clone().requires_grad_() for t in (q, k, v)]
+
+    out = flash_attn_func(
+        q, k, v, causal=True, window_size=window_size,
+        score_mod=linear_penalty_score_mod, score_mod_bwd=identity_score_mod_bwd,
+    )
+    left = window_size[0]
+    ref = ref_attention(
+        qr, kr, vr,
+        score_mod_fn=lambda s, qi, ki: s + (qi - ki).float() * SLOPE,
+        mask_mod_fn=(
+            (lambda qi, ki: (ki <= qi) & (ki >= qi - left)) if left is not None
+            else (lambda qi, ki: ki <= qi)
+        ),
+    )
+    torch.testing.assert_close(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+    do = torch.randn_like(out)
+    out.backward(do)
+    ref.backward(do)
+    for got, want, name in [(q, qr, "dq"), (k, kr, "dk"), (v, vr, "dv")]:
+        torch.testing.assert_close(
+            got.grad.float(), want.grad.float(), atol=1e-1, rtol=1e-1,
+            msg=lambda m, n=name: f"{n}: {m}",
+        )
