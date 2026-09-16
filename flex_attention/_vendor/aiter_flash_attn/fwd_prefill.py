@@ -1051,6 +1051,9 @@ def attn_fwd(
     stride_bs_fidx_m=0,
     BLOCK_SPARSE: tl.constexpr = False,
     BS_HAS_FULL: tl.constexpr = False,
+    NUM_SPLITS: tl.constexpr = 1,
+    stride_o_split=0,
+    stride_lse_split=0,
 ):
     # set params
     ACCUMULATOR_TYPE = tl.float32
@@ -1061,7 +1064,14 @@ def attn_fwd(
     off_h_q = remap_xcd(off_h_q, HQ, NUM_XCD)
 
     start_m = tl.program_id(1)
-    off_z = tl.program_id(2)
+    # With NUM_SPLITS > 1 the KV loop is sliced across programs to raise occupancy; the
+    # split index is folded into the batch grid dimension (triton grids are 3-D).
+    if NUM_SPLITS > 1:
+        off_z = tl.program_id(2) // NUM_SPLITS
+        split_id = tl.program_id(2) % NUM_SPLITS
+    else:
+        off_z = tl.program_id(2)
+        split_id = 0
     # If MQA / GQA, set the K and V head offsets appropriately.
     GROUP_SIZE: tl.constexpr = HQ // HK
     if GROUP_SIZE != 1:
@@ -1184,10 +1194,23 @@ def attn_fwd(
     # ============================================================
     #          PROGRAM EARLY EXIT (All K Blocks Skipped)
     # ============================================================
+    # KV window owned by this split, in elements. Splits carve the key axis into
+    # NUM_SPLITS contiguous chunks aligned to BLOCK_N so no block straddles two splits.
+    if NUM_SPLITS > 1:
+        total_k_blocks_split = tl.cdiv(seqlen_k, BLOCK_N)
+        blocks_per_split = tl.cdiv(total_k_blocks_split, NUM_SPLITS)
+        split_lo = split_id * blocks_per_split * BLOCK_N
+        split_hi = tl.minimum((split_id + 1) * blocks_per_split * BLOCK_N, seqlen_k)
+    else:
+        split_lo = 0
+        split_hi = seqlen_k
+
     if BLOCK_SPARSE:
         total_visible_blocks = bs_mask_cnt + bs_full_cnt
     else:
         total_visible_blocks = n_front_masked_blocks + n_full_blocks + n_back_masked_blocks
+    if NUM_SPLITS > 1 and split_hi <= split_lo:
+        total_visible_blocks = 0
     if total_visible_blocks == 0:
         """
         No K blocks visible - write zeros and exit.
@@ -1195,6 +1218,7 @@ def attn_fwd(
         # Write zeros to output
         o_offset = (
             Out
+            + split_id * stride_o_split
             + off_z * stride_oz
             + off_h_q * stride_oh
             + cu_seqlens_q_start * stride_om
@@ -1212,12 +1236,20 @@ def attn_fwd(
         # Write zeros to LSE
         l_ptrs = (
             LSE
+            + split_id * stride_lse_split
             + off_z * stride_lse_z
             + off_h_q * stride_lse_h
             + cu_seqlens_q_start * stride_lse_m
             + offs_m * stride_lse_m
         )
-        tl.store(l_ptrs, tl.zeros([BLOCK_M], dtype=tl.float32), mask=offs_m < seqlen_q)
+        # A split that owns no visible blocks must report -inf, not 0, or the combine
+        # would fold in a spurious weight-1 contribution. The non-split path keeps the
+        # historical 0 fill, which downstream code expects for a fully-masked row.
+        if NUM_SPLITS > 1:
+            empty_lse = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+        else:
+            empty_lse = tl.zeros([BLOCK_M], dtype=tl.float32)
+        tl.store(l_ptrs, empty_lse, mask=offs_m < seqlen_q)
         return
 
     # ============================================================
@@ -1365,6 +1397,10 @@ def attn_fwd(
             block_min = n_front_skip_blocks * BLOCK_N
             block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
 
+            # Restrict this phase to the split's KV window.
+            if NUM_SPLITS > 1:
+                block_min = tl.maximum(block_min, split_lo)
+                block_max = tl.minimum(block_max, split_hi)
             acc, l_i, m_i = _attn_fwd_inner(
                 acc,
                 l_i,
@@ -1434,6 +1470,10 @@ def attn_fwd(
                 n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
             ) * BLOCK_N
 
+            # Restrict this phase to the split's KV window.
+            if NUM_SPLITS > 1:
+                block_min = tl.maximum(block_min, split_lo)
+                block_max = tl.minimum(block_max, split_hi)
             acc, l_i, m_i = _attn_fwd_inner(
                 acc,
                 l_i,
@@ -1508,6 +1548,10 @@ def attn_fwd(
                 + n_back_masked_blocks
             ) * BLOCK_N
 
+            # Restrict this phase to the split's KV window.
+            if NUM_SPLITS > 1:
+                block_min = tl.maximum(block_min, split_lo)
+                block_max = tl.minimum(block_max, split_hi)
             acc, l_i, m_i = _attn_fwd_inner(
                 acc,
                 l_i,
@@ -1621,6 +1665,7 @@ def attn_fwd(
     # write back LSE(Log Sum Exponents), the log of the normalization constant
     l_offset = (
         LSE
+        + split_id * stride_lse_split
         + off_z * stride_lse_z
         + off_h_q * stride_lse_h
         + cu_seqlens_q_start * stride_lse_m
@@ -1640,7 +1685,11 @@ def attn_fwd(
 
     # write back O
     o_offset = (
-        Out + off_z * stride_oz + off_h_q * stride_oh + cu_seqlens_q_start * stride_om
+        Out
+        + split_id * stride_o_split
+        + off_z * stride_oz
+        + off_h_q * stride_oh
+        + cu_seqlens_q_start * stride_om
     )
     o_ptrs = o_offset + offs_m[:, None] * stride_om + offs_d_v[None, :] * stride_on
     o_ptrs_mask = tl.full([BLOCK_M, BLOCK_DMODEL_V], 1, dtype=tl.int1)
@@ -1696,6 +1745,9 @@ def attention_forward_prefill_triton_impl(
     mask_mod=None,
     learnable_sink=None,
     block_sparse=None,
+    num_splits: int = 1,
+    out_partial=None,
+    lse_partial=None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -2058,9 +2110,25 @@ def attention_forward_prefill_triton_impl(
         stride_qh % 8 == 0 and stride_kh % 8 == 0 and stride_vh % 8 == 0
     )
 
-    # launch kernel
+    # launch kernel. With num_splits > 1 the kernel writes per-split partials, which the
+    # caller reduces; the split index rides in the batch grid dimension.
+    if num_splits > 1:
+        out_target = out_partial
+        lse_target = lse_partial
+        stride_o_split = out_partial.stride(0)
+        stride_lse_split = lse_partial.stride(0)
+    else:
+        out_target = o
+        lse_target = softmax_lse
+        stride_o_split = 0
+        stride_lse_split = 0
+
     def grid(META):
-        return (nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]), batch)
+        return (
+            nheads_q,
+            triton.cdiv(max_seqlens_q, META["BLOCK_M"]),
+            batch * num_splits,
+        )
 
     # flex_attention addition (Phase 4 / MLA): AITER's tuned configs use BLOCK_M=128,
     # whose Q tile overflows CDNA3's 64 KiB LDS once padded_d_model_qk >= 512. Rather
@@ -2123,8 +2191,8 @@ def attention_forward_prefill_triton_impl(
         stride_q_descale_z,
         stride_k_descale_z,
         stride_v_descale_z,
-        softmax_lse,
-        o,
+        lse_target,
+        out_target,
         sd_mask,
         alibi_slopes,
         stride_qb,
@@ -2209,5 +2277,8 @@ def attention_forward_prefill_triton_impl(
         stride_bs_fidx_m=0 if (block_sparse is None or block_sparse.full_block_idx is None) else block_sparse.full_block_idx.stride(2),
         BLOCK_SPARSE=block_sparse is not None,
         BS_HAS_FULL=block_sparse is not None and block_sparse.full_block_cnt is not None,
+        NUM_SPLITS=num_splits,
+        stride_o_split=stride_o_split,
+        stride_lse_split=stride_lse_split,
         **block_overrides,
     )

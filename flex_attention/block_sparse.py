@@ -30,6 +30,7 @@ __all__ = [
     "backward_block_sparse",
     "combine_block_sparse",
     "create_block_sparse_from_mask_mod",
+    "create_block_sparse_varlen",
     "dense_to_block_sparse",
     "transpose_block_sparse",
 ]
@@ -217,3 +218,52 @@ def backward_block_sparse(
     dkdv_lists = transpose_block_sparse(dq_lists, num_kv_blocks)
     slot[key] = (dq_lists, dkdv_lists)
     return dq_lists, dkdv_lists
+
+
+def create_block_sparse_varlen(
+    mask_fn,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    nheads: int,
+    block_size: Tuple[int, int] = (128, 128),
+) -> BlockSparseTensors:
+    """Block mask for the varlen (thd) layout.
+
+    Block indices are **sequence-local**: the kernel already offsets Q/K/V by
+    ``cu_seqlens``, so a list entry ``j`` means "the j-th KV block of *this* sequence",
+    exactly as ``mask_mod``'s ``kv_idx`` is sequence-local. The q-block axis is padded to
+    the longest sequence; short sequences simply carry zero counts in their tail blocks
+    (the kernel also returns early for q blocks past their sequence).
+
+    ``mask_fn(b, h, q_idx, kv_idx) -> bool`` is a plain PyTorch callable, as in
+    ``create_block_sparse_from_mask_mod``.
+    """
+    q_bs, kv_bs = block_size
+    device = cu_seqlens_q.device
+    batch = cu_seqlens_q.numel() - 1
+    seqlens_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
+    seqlens_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).tolist()
+    max_q_blocks = max((s + q_bs - 1) // q_bs for s in seqlens_q)
+    max_kv_blocks = max((s + kv_bs - 1) // kv_bs for s in seqlens_k)
+
+    full = torch.zeros(batch, nheads, max_q_blocks, max_kv_blocks, dtype=torch.bool, device=device)
+    partial = torch.zeros_like(full)
+    for b in range(batch):
+        sq, sk = seqlens_q[b], seqlens_k[b]
+        nq, nkv = (sq + q_bs - 1) // q_bs, (sk + kv_bs - 1) // kv_bs
+        q_idx = torch.arange(nq * q_bs, device=device).view(1, nq * q_bs, 1)
+        kv_idx = torch.arange(nkv * kv_bs, device=device).view(1, 1, nkv * kv_bs)
+        h_idx = torch.arange(nheads, device=device).view(nheads, 1, 1)
+        keep = mask_fn(b, h_idx, q_idx, kv_idx).expand(nheads, nq * q_bs, nkv * kv_bs)
+        # positions past this sequence's length are never attended
+        keep = keep & (q_idx < sq) & (kv_idx < sk)
+        per_block = (
+            keep.reshape(nheads, nq, q_bs, nkv, kv_bs)
+            .permute(0, 1, 3, 2, 4)
+            .reshape(nheads, nq, nkv, q_bs * kv_bs)
+        )
+        any_kept = per_block.any(dim=-1)
+        all_kept = per_block.all(dim=-1)
+        full[b, :, :nq, :nkv] = all_kept
+        partial[b, :, :nq, :nkv] = any_kept & ~all_kept
+    return dense_to_block_sparse(full, partial, block_size)

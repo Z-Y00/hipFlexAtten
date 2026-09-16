@@ -2,6 +2,7 @@ from flex_attention.interface import flash_attn_func, flash_attn_varlen_func
 from flex_attention.block_sparse import (
     BlockSparseTensors,
     create_block_sparse_from_mask_mod,
+    create_block_sparse_varlen,
     dense_to_block_sparse,
 )
 from flex_attention.mods import (
@@ -14,6 +15,7 @@ from flex_attention.mods import (
 __all__ = [
     "BlockSparseTensors",
     "create_block_sparse_from_mask_mod",
+    "create_block_sparse_varlen",
     "dense_to_block_sparse",
     "flash_attn_func",
     "flash_attn_varlen_func",

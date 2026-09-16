@@ -10,8 +10,8 @@ Supported: causal, varlen, GQA/MQA, sliding window, return_lse, forward+backward
 (Phase 1); softcap and learnable_sink (Phase 2); score_mod / mask_mod / score_mod_bwd
 (Phase 3); MLA and other large or asymmetric head dims up to 576/512 (Phase 4);
 block-sparse attention (Phase 5, dense layout only). Still unsupported, raising a clear
-NotImplementedError: qv / gather_kv_indices (top-k sparse KV), num_splits > 1, and
-block-sparse under varlen.
+NotImplementedError: qv / gather_kv_indices (top-k sparse KV) and num_splits > 1 under
+varlen.
 
 All supported features compose freely (causal with window_size, score_mod and MLA head
 dims together, and so on). Earlier revisions rejected several such combinations; those
@@ -31,6 +31,7 @@ from flex_attention._vendor.aiter_flash_attn.fwd_prefill import (
 )
 from flex_attention.block_sparse import backward_block_sparse
 from flex_attention.mods import make_softcap_score_mod
+from flex_attention.split_combine import combine_splits
 
 __all__ = ["flash_attn_func", "flash_attn_varlen_func"]
 
@@ -130,10 +131,11 @@ class _FlashAttnFunc(torch.autograd.Function):
         score_mod_bwd=None,
         learnable_sink=None,
         block_sparse=None,
+        num_splits=1,
     ):
         is_varlen = cu_seqlens_q is not None
-        if block_sparse is not None and is_varlen:
-            raise NotImplementedError("block_sparse is not supported with varlen yet")
+        if num_splits > 1 and is_varlen:
+            raise NotImplementedError("num_splits > 1 is not supported with varlen yet")
         layout = "thd" if is_varlen else "bshd"
         window_size_left, window_size_right = _resolve_window(window_size)
         head_dim = q.shape[-1]
@@ -149,6 +151,19 @@ class _FlashAttnFunc(torch.autograd.Function):
             batch, seqlen_q, nheads_q, _ = q.shape
             o = torch.empty(batch, seqlen_q, nheads_q, head_dim_v, dtype=q.dtype, device=q.device)
             softmax_lse = torch.empty(batch, nheads_q, seqlen_q, dtype=torch.float32, device=q.device)
+
+        # Split-KV: the kernel writes per-split partials that are reduced below. Splits
+        # only change *how* the forward is evaluated -- o and softmax_lse come out
+        # identical -- so the backward needs no awareness of them.
+        out_partial = lse_partial = None
+        if num_splits > 1:
+            out_partial = torch.empty(
+                num_splits, batch, seqlen_q, nheads_q, head_dim_v,
+                dtype=torch.float32, device=q.device,
+            )
+            lse_partial = torch.empty(
+                num_splits, batch, nheads_q, seqlen_q, dtype=torch.float32, device=q.device
+            )
 
         attention_forward_prefill_triton_impl(
             q,
@@ -180,7 +195,12 @@ class _FlashAttnFunc(torch.autograd.Function):
             mask_mod=mask_mod,
             learnable_sink=None if learnable_sink is None else learnable_sink.contiguous().float(),
             block_sparse=block_sparse,
+            num_splits=num_splits,
+            out_partial=out_partial,
+            lse_partial=lse_partial,
         )
+        if num_splits > 1:
+            combine_splits(out_partial, lse_partial, o, softmax_lse)
 
         ctx.save_for_backward(q, k, v, o, softmax_lse, cu_seqlens_q, cu_seqlens_k, learnable_sink)
         ctx.score_mod = score_mod
@@ -227,7 +247,10 @@ class _FlashAttnFunc(torch.autograd.Function):
         bs_dq = bs_dkdv = None
         if ctx.block_sparse is not None:
             _, kv_bs = ctx.block_sparse.block_size
-            num_kv_blocks = (k.shape[1] + kv_bs - 1) // kv_bs
+            # varlen packs k as (total_seqlen, nheads, head_dim), so k.shape[1] is the
+            # head count, not a sequence length; use the recorded max instead.
+            seqlen_k_for_blocks = ctx.max_seqlen_k if is_varlen else k.shape[1]
+            num_kv_blocks = (seqlen_k_for_blocks + kv_bs - 1) // kv_bs
             bs_dq, bs_dkdv = backward_block_sparse(ctx.block_sparse, num_kv_blocks)
 
         attention_backward_triton_impl(
@@ -280,7 +303,7 @@ class _FlashAttnFunc(torch.autograd.Function):
             dsink = -(p_sink * d).sum(dim=reduce_axes).to(learnable_sink.dtype)
 
         # One None per non-tensor forward arg after q/k/v.
-        return (dq, dk, dv) + (None,) * 12 + (dsink, None)
+        return (dq, dk, dv) + (None,) * 12 + (dsink, None, None)
 
 
 def flash_attn_func(
@@ -316,7 +339,11 @@ def flash_attn_func(
     single program (the atomics live in AITER's separate "fused_atomic" mode, which this
     project never uses) and were verified bitwise-identical across repeated runs. So the
     backward is always deterministic, and there is no slower alternative path to select.
-    ``num_splits`` (split-KV forward) is not yet wired up; only num_splits=1 is supported.
+    ``num_splits`` > 1 slices the KV loop across programs and reduces the partials
+    afterwards. It changes only *how* the forward is evaluated -- the output and LSE are
+    unchanged, and the backward is unaffected -- so it is purely an occupancy knob: it
+    helps when batch * nheads * q_blocks is too small to fill the GPU (short queries over
+    a long context) and costs a little otherwise. Not supported with varlen.
 
     ``score_mod`` / ``mask_mod`` (FlexAttention-style) must be ``@triton.jit`` functions,
     inlined into the kernel at compile time:
@@ -352,8 +379,8 @@ def flash_attn_func(
         head_dim_v=v.shape[-1],
         deterministic=deterministic,
     )
-    if num_splits != 1:
-        raise NotImplementedError("num_splits != 1 is not yet supported by the Triton/AMD backend")
+    if num_splits < 1:
+        raise ValueError(f"num_splits must be >= 1, got {num_splits}")
 
     if softcap != 0.0:
         score_mod, score_mod_bwd = make_softcap_score_mod(softcap)
@@ -361,7 +388,7 @@ def flash_attn_func(
     o, lse = _FlashAttnFunc.apply(
         q, k, v, softmax_scale, causal, window_size, deterministic, return_lse,
         None, None, None, None, score_mod, mask_mod, score_mod_bwd, learnable_sink,
-        block_sparse_tensors,
+        block_sparse_tensors, num_splits,
     )
     return (o, lse) if return_lse else o
 
@@ -422,8 +449,8 @@ def flash_attn_varlen_func(
         head_dim_v=v.shape[-1],
         deterministic=deterministic,
     )
-    if num_splits != 1:
-        raise NotImplementedError("num_splits != 1 is not yet supported by the Triton/AMD backend")
+    if num_splits < 1:
+        raise ValueError(f"num_splits must be >= 1, got {num_splits}")
 
     if softcap != 0.0:
         score_mod, score_mod_bwd = make_softcap_score_mod(softcap)
@@ -446,5 +473,6 @@ def flash_attn_varlen_func(
         score_mod_bwd,
         learnable_sink,
         block_sparse_tensors,
+        num_splits,
     )
     return (o, lse) if return_lse else o

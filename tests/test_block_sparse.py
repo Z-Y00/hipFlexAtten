@@ -143,16 +143,43 @@ def test_block_sparse_empty_rows():
 
 
 @needs_gpu
-def test_block_sparse_rejects_varlen():
-    device = "cuda"
-    from flex_attention import flash_attn_varlen_func
+def test_block_sparse_varlen_matches_dense_varlen():
+    """Sparse block indices are sequence-local under varlen, exactly like mask_mod's."""
+    from flex_attention import create_block_sparse_varlen, flash_attn_varlen_func
 
-    nheads, head_dim, seqlen = 1, 64, 128
-    cu = torch.tensor([0, seqlen], dtype=torch.int32, device=device)
-    t = torch.randn(seqlen, nheads, head_dim, dtype=torch.bfloat16, device=device)
-    bs = create_block_sparse_from_mask_mod(
-        lambda b, h, qi, ki: ki <= qi, 1, nheads, seqlen, seqlen,
-        block_size=(BLOCK, BLOCK), device=device,
+    device = "cuda"
+    nheads, head_dim = 2, 64
+    seqlens = [128, 192, 64]  # deliberately ragged, none a multiple of the other
+    cu = torch.tensor(
+        [0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32, device=device
     )
-    with pytest.raises(NotImplementedError, match="varlen"):
-        flash_attn_varlen_func(t, t, t, cu, cu, seqlen, seqlen, block_sparse_tensors=bs)
+    total, max_s = cu[-1].item(), max(seqlens)
+    torch.manual_seed(0)
+    mk = lambda: (  # noqa: E731
+        torch.randn(total, nheads, head_dim, dtype=torch.bfloat16, device=device) * 0.3
+    ).requires_grad_()
+    q, k, v = mk(), mk(), mk()
+    qr, kr, vr = [t.detach().clone().requires_grad_() for t in (q, k, v)]
+    scale = head_dim**-0.5
+
+    bs = create_block_sparse_varlen(
+        lambda b, h, qi, ki: ki <= qi, cu, cu, nheads, block_size=(BLOCK, BLOCK)
+    )
+    # the shortest sequence must have fewer populated q blocks than the longest
+    assert bs.mask_block_cnt[2, 0].sum() < bs.mask_block_cnt[1, 0].sum()
+
+    out = flash_attn_varlen_func(
+        q, k, v, cu, cu, max_s, max_s, softmax_scale=scale,
+        mask_mod=causal_mask_mod, block_sparse_tensors=bs,
+    )
+    ref = flash_attn_varlen_func(qr, kr, vr, cu, cu, max_s, max_s, softmax_scale=scale, causal=True)
+    torch.testing.assert_close(out.float(), ref.float(), atol=1e-3, rtol=1e-3)
+
+    do = torch.randn_like(out)
+    out.backward(do)
+    ref.backward(do)
+    for got, want, name in [(q, qr, "dq"), (k, kr, "dk"), (v, vr, "dv")]:
+        torch.testing.assert_close(
+            got.grad.float(), want.grad.float(), atol=1e-2, rtol=1e-2,
+            msg=lambda m, n=name: f"{n}: {m}",
+        )
