@@ -93,4 +93,5 @@ def test_unsupported_features_raise():
     with pytest.raises(NotImplementedError):
         flash_attn_func(q, k, v, learnable_sink=torch.zeros(2, device=device))
     with pytest.raises(NotImplementedError):
-        flash_attn_func(q, k, v, mask_mod=lambda *a: True)
+        flash_attn_func(q, k, v, block_sparse_tensors=object())
+    # score_mod / mask_mod are supported as of Phase 3 -- see tests/test_score_mod.py.

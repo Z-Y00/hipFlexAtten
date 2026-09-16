@@ -2874,6 +2874,11 @@ def _bwd_dkdv_inner(
     FP8_MAX: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
+    off_z=None,
+    off_h_q=None,
+    SCORE_MOD: tl.constexpr = None,
+    MASK_MOD: tl.constexpr = None,
+    SCORE_MOD_BWD: tl.constexpr = None,
 ):
     # if HEAD_DIM is padded
     PADDED_HEAD_QK: tl.constexpr = ACTUAL_HEAD_DIM_QK != HEAD_DIM_QK
@@ -2934,6 +2939,19 @@ def _bwd_dkdv_inner(
             relative_pos_block = offs_n[:, None] + seqlen_q - seqlen_k - offs_m[None, :]
             alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
             qkT_scaled += alibi_block
+
+        # score_mod / mask_mod. NOTE: everything here is TRANSPOSED relative to the
+        # forward kernel -- qkT_scaled is (BLOCK_N, BLOCK_M), so the query index varies
+        # along columns and the key index along rows. The user's mod callables are
+        # written against (q_idx, kv_idx) pairs and are elementwise, so passing
+        # q_idx=offs_m[None, :] / kv_idx=offs_n[:, None] gives them the same logical
+        # (q, kv) pairing the forward kernel passes, just in the transposed layout.
+        qkT_premod = qkT_scaled
+        if SCORE_MOD is not None:
+            qkT_scaled = SCORE_MOD(qkT_scaled, off_z, off_h_q, offs_m[None, :], offs_n[:, None])
+        if MASK_MOD is not None:
+            keep_mod = MASK_MOD(off_z, off_h_q, offs_m[None, :], offs_n[:, None])
+            qkT_scaled = tl.where(keep_mod, qkT_scaled, float("-inf"))
 
         if DEBUG_TRITON_DETAIL and start_n == 256:
             print(f"qT: {qT.shape}\n", qT)
@@ -3016,6 +3034,13 @@ def _bwd_dkdv_inner(
             dpT = dpT * scaled_mask
         delta_i = Di[None, :]
         dsT = pT * (dpT - delta_i)
+        # score_mod VJP, then re-zero anything mask_mod dropped: a user's
+        # score_mod_bwd formula is not required to map a zero input gradient to a zero
+        # output, so rely on the mask rather than on dsT already being 0 there.
+        if SCORE_MOD_BWD is not None:
+            dsT = SCORE_MOD_BWD(dsT, qkT_premod, off_z, off_h_q, offs_m[None, :], offs_n[:, None])
+        if MASK_MOD is not None:
+            dsT = tl.where(keep_mod, dsT, 0.0)
         if IS_FP8:
             # Rewrite dk += dsT @ qT.T as dk += (qT @ dsT.T).T
             # This puts FP8 tensor (qT) on LHS of dot product
@@ -3085,6 +3110,11 @@ def _bwd_dq_inner(
     FP8_MAX: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
+    off_z=None,
+    off_h_q=None,
+    SCORE_MOD: tl.constexpr = None,
+    MASK_MOD: tl.constexpr = None,
+    SCORE_MOD_BWD: tl.constexpr = None,
 ):
     # if HEAD_DIM is padded
     PADDED_HEAD_QK: tl.constexpr = ACTUAL_HEAD_DIM_QK != HEAD_DIM_QK
@@ -3154,6 +3184,14 @@ def _bwd_dq_inner(
             alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
             qk_scaled += alibi_block
 
+        # score_mod / mask_mod (non-transposed here, unlike the dK/dV inner loop).
+        qk_premod = qk_scaled
+        if SCORE_MOD is not None:
+            qk_scaled = SCORE_MOD(qk_scaled, off_z, off_h_q, offs_m[:, None], offs_n[None, :])
+        if MASK_MOD is not None:
+            keep_mod = MASK_MOD(off_z, off_h_q, offs_m[:, None], offs_n[None, :])
+            qk_scaled = tl.where(keep_mod, qk_scaled, float("-inf"))
+
         if DEBUG_TRITON_DETAIL:
             print(f"qk scaled: {qk.shape}\n", qk_scaled)
 
@@ -3210,6 +3248,12 @@ def _bwd_dq_inner(
             dp = dp * scaled_mask
         delta_i = Di[:, None]
         ds = p * (dp - delta_i)
+        # score_mod VJP, then re-zero anything mask_mod dropped (see the matching
+        # comment in _bwd_dkdv_inner for why the mask is re-applied explicitly).
+        if SCORE_MOD_BWD is not None:
+            ds = SCORE_MOD_BWD(ds, qk_premod, off_z, off_h_q, offs_m[:, None], offs_n[None, :])
+        if MASK_MOD is not None:
+            ds = tl.where(keep_mod, ds, 0.0)
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         if IS_FP8:
@@ -4026,6 +4070,9 @@ def bwd_kernel_fused_noncausal(
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
+    SCORE_MOD: tl.constexpr = None,
+    MASK_MOD: tl.constexpr = None,
+    SCORE_MOD_BWD: tl.constexpr = None,
 ):
     # program ids
     hkid = tl.program_id(0)
@@ -4207,6 +4254,11 @@ def bwd_kernel_fused_noncausal(
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                off_z=bid,
+                off_h_q=hqid,
+                SCORE_MOD=SCORE_MOD,
+                MASK_MOD=MASK_MOD,
+                SCORE_MOD_BWD=SCORE_MOD_BWD,
             )
 
         # Write back dV
@@ -4297,7 +4349,7 @@ def bwd_kernel_fused_noncausal(
                 num_steps = tl.cdiv(seqlen_k, BLOCK_N2)
 
             dq = tl.zeros([BLOCK_M2, HEAD_DIM_QK], dtype=tl.float32)
-            dq = _bwd_dq_inner(
+            dq = _bwd_dq_inner(  # noncausal fused dQ (score_mod/mask_mod path)
                 dq,
                 q,
                 K,
@@ -4347,6 +4399,11 @@ def bwd_kernel_fused_noncausal(
                 FP8_MAX=FP8_MAX,
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                off_z=bid,
+                off_h_q=hqid,
+                SCORE_MOD=SCORE_MOD,
+                MASK_MOD=MASK_MOD,
+                SCORE_MOD_BWD=SCORE_MOD_BWD,
             )
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
@@ -4403,6 +4460,11 @@ def attention_backward_triton_impl(
     v_descale: torch.Tensor | None = None,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    # score_mod / mask_mod (Phase 3, flex_attention-specific -- not upstream AITER).
+    # Only supported on the non-causal "fused" path; see the guard below.
+    score_mod=None,
+    mask_mod=None,
+    score_mod_bwd=None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -4667,6 +4729,18 @@ def attention_backward_triton_impl(
     if use_sliding_window and mode != "fused":
         raise NotImplementedError(
             "Sliding-window backward is currently implemented for fused mode only."
+        )
+
+    # score_mod/mask_mod are only threaded through the non-causal fused kernel
+    # (bwd_kernel_fused_noncausal -> _bwd_dkdv_inner / _bwd_dq_inner). The causal
+    # fused kernel is broken at this pinned commit and the "split" kernels use a
+    # separate pair of inner helpers that were not instrumented. Callers express
+    # causality as a mask_mod instead -- see flex_attention/interface.py.
+    has_mod = score_mod is not None or mask_mod is not None or score_mod_bwd is not None
+    if has_mod and (mode != "fused" or causal):
+        raise NotImplementedError(
+            "score_mod/mask_mod backward requires the non-causal fused path "
+            f"(got mode={mode!r}, causal={causal}). Express causality as a mask_mod."
         )
     # Either edge may be unbounded and is handled uniformly (mirroring the forward
     # kernels): WINDOW_SIZE_LEFT < 0 lets keys reach back to 0 / queries have no
@@ -4964,6 +5038,9 @@ def attention_backward_triton_impl(
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
                 NUM_XCD=num_xcd,
+                SCORE_MOD=score_mod,
+                MASK_MOD=mask_mod,
+                SCORE_MOD_BWD=score_mod_bwd,
             )
     elif mode == "fused_atomic":
         NUM_WARPS, NUM_STAGES = 4, 1

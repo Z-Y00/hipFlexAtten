@@ -41,6 +41,9 @@ def _check_unsupported(
     aux_scalars,
     block_sparse_tensors,
     block_sparse_tensors_bwd,
+    causal,
+    window_size,
+    requires_grad,
 ):
     if qv is not None:
         raise NotImplementedError("qv-packed input is not yet supported by the Triton/AMD backend")
@@ -52,14 +55,35 @@ def _check_unsupported(
         raise NotImplementedError("learnable_sink is not yet wired up in the Triton/AMD backend (Phase 2)")
     if softcap != 0.0:
         raise NotImplementedError("softcap is not yet supported by the Triton/AMD backend (Phase 2)")
-    if score_mod is not None or score_mod_bwd is not None:
-        raise NotImplementedError("score_mod is not yet supported by the Triton/AMD backend (Phase 3)")
-    if mask_mod is not None:
-        raise NotImplementedError("mask_mod is not yet supported by the Triton/AMD backend (Phase 3)")
     if aux_tensors is not None or aux_scalars is not None:
         raise NotImplementedError("aux_tensors/aux_scalars are only used by score_mod/mask_mod, unsupported for now")
     if block_sparse_tensors is not None or block_sparse_tensors_bwd is not None:
         raise NotImplementedError("block_sparse_tensors is not yet supported by the Triton/AMD backend (Phase 5)")
+
+    has_mod = score_mod is not None or mask_mod is not None
+    if score_mod_bwd is not None and score_mod is None:
+        raise ValueError("score_mod_bwd was given without score_mod")
+    if has_mod and requires_grad:
+        # The backward instrumentation only exists on AITER's non-causal fused path;
+        # the causal fused kernel is broken at the pinned commit and the "split"
+        # kernels use a separate pair of inner helpers that weren't instrumented.
+        if causal:
+            raise NotImplementedError(
+                "score_mod/mask_mod with causal=True is not supported in the backward pass. "
+                "Express causality as a mask_mod instead (see flex_attention.causal_mask_mod) "
+                "and pass causal=False."
+            )
+        if window_size != (None, None):
+            raise NotImplementedError(
+                "score_mod/mask_mod with window_size is not supported in the backward pass. "
+                "Express the window as a mask_mod instead."
+            )
+    if score_mod is not None and score_mod_bwd is None and requires_grad:
+        raise ValueError(
+            "score_mod requires score_mod_bwd for the backward pass: score_mod is inlined "
+            "into the Triton kernel and is not auto-differentiated, so you must supply its "
+            "VJP explicitly (same contract as flash_attn.cute's score_mod_bwd)."
+        )
 
 
 class _FlashAttnFunc(torch.autograd.Function):
@@ -78,6 +102,9 @@ class _FlashAttnFunc(torch.autograd.Function):
         cu_seqlens_k: Optional[torch.Tensor],
         max_seqlen_q: Optional[int],
         max_seqlen_k: Optional[int],
+        score_mod=None,
+        mask_mod=None,
+        score_mod_bwd=None,
     ):
         is_varlen = cu_seqlens_q is not None
         layout = "thd" if is_varlen else "bshd"
@@ -122,9 +149,14 @@ class _FlashAttnFunc(torch.autograd.Function):
             None,  # q_descale
             None,  # k_descale
             None,  # v_descale
+            score_mod=score_mod,
+            mask_mod=mask_mod,
         )
 
         ctx.save_for_backward(q, k, v, o, softmax_lse, cu_seqlens_q, cu_seqlens_k)
+        ctx.score_mod = score_mod
+        ctx.mask_mod = mask_mod
+        ctx.score_mod_bwd = score_mod_bwd
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size_left = window_size_left
@@ -158,7 +190,14 @@ class _FlashAttnFunc(torch.autograd.Function):
         # the reference to fp16/bf16 precision). So causal always uses "split" regardless of
         # `deterministic`, until this is fixed upstream or independently root-caused; only
         # non-causal gets the deterministic/fused choice.
-        mode = "split" if (ctx.causal or ctx.deterministic) else "fused"
+        # score_mod/mask_mod are only instrumented on the non-causal fused path, and
+        # _check_unsupported already rejected causal/window with a mod when grad is
+        # required, so "fused" is always the right mode here.
+        has_mod = ctx.score_mod is not None or ctx.mask_mod is not None
+        if has_mod:
+            mode = "fused"
+        else:
+            mode = "split" if (ctx.causal or ctx.deterministic) else "fused"
         has_window = ctx.window_size_left != -1 or ctx.window_size_right != -1
         if mode == "split" and has_window:
             # AITER's "split" backward doesn't support window_size at all, and "fused" -
@@ -194,8 +233,12 @@ class _FlashAttnFunc(torch.autograd.Function):
             mode=mode,
             window_size_left=ctx.window_size_left,
             window_size_right=ctx.window_size_right,
+            score_mod=ctx.score_mod,
+            mask_mod=ctx.mask_mod,
+            score_mod_bwd=ctx.score_mod_bwd,
         )
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+        # One None per non-tensor forward arg after q/k/v (15 total forward args).
+        return (dq, dk, dv) + (None,) * 12
 
 
 def flash_attn_func(
@@ -238,6 +281,18 @@ def flash_attn_func(
     ``deterministic`` -- AITER's "fused"/"fused_atomic" causal backward are broken at the
     pinned commit (wrong dV / a crash respectively; see the backend's NOTICE.md).
     ``num_splits`` (split-KV forward) is not yet wired up; only num_splits=1 is supported.
+
+    ``score_mod`` / ``mask_mod`` (FlexAttention-style) must be ``@triton.jit`` functions,
+    inlined into the kernel at compile time:
+        score_mod(score, b, h, q_idx, kv_idx) -> new_score
+        mask_mod(b, h, q_idx, kv_idx) -> bool tile (True = keep)
+        score_mod_bwd(dscore, score, b, h, q_idx, kv_idx) -> dscore_wrt_score_mod_input
+    ``score_mod`` is NOT auto-differentiated -- if gradients are needed you must supply
+    ``score_mod_bwd`` (its VJP), matching flash_attn.cute's contract. ``mask_mod`` needs
+    no such hook (non-differentiable; masked positions get zero gradient).
+    In the backward pass these are only supported with ``causal=False`` and no
+    ``window_size`` -- express either as a ``mask_mod`` instead (see
+    ``flex_attention.causal_mask_mod``).
     """
     _check_unsupported(
         qv,
@@ -251,12 +306,17 @@ def flash_attn_func(
         aux_scalars,
         block_sparse_tensors,
         block_sparse_tensors_bwd,
+        causal,
+        window_size,
+        requires_grad=torch.is_grad_enabled()
+        and (q.requires_grad or k.requires_grad or v.requires_grad),
     )
     if num_splits != 1:
         raise NotImplementedError("num_splits != 1 is not yet supported by the Triton/AMD backend")
 
     o, lse = _FlashAttnFunc.apply(
-        q, k, v, softmax_scale, causal, window_size, deterministic, return_lse, None, None, None, None
+        q, k, v, softmax_scale, causal, window_size, deterministic, return_lse,
+        None, None, None, None, score_mod, mask_mod, score_mod_bwd,
     )
     return (o, lse) if return_lse else o
 
@@ -290,7 +350,12 @@ def flash_attn_varlen_func(
 ):
     """Varlen (thd) flash attention. q/k/v: (total_seqlen, nheads, head_dim);
     cu_seqlens_{q,k} are int32 [batch + 1] cumulative sequence-length offsets.
-    See flash_attn_func for the pack_gqa/deterministic/num_splits notes.
+    See flash_attn_func for the pack_gqa/deterministic/num_splits/score_mod notes.
+
+    NOTE for score_mod/mask_mod under varlen: q_idx/kv_idx passed to your callables are
+    *sequence-local* (0-based within each sequence), not offsets into the packed buffer,
+    and ``b`` is the batch index within cu_seqlens -- so a causal mask_mod works
+    unchanged across varlen and dense.
     """
     _check_unsupported(
         qv,
@@ -304,6 +369,10 @@ def flash_attn_varlen_func(
         aux_scalars,
         block_sparse_tensors,
         block_sparse_tensors_bwd,
+        causal,
+        window_size,
+        requires_grad=torch.is_grad_enabled()
+        and (q.requires_grad or k.requires_grad or v.requires_grad),
     )
     if num_splits != 1:
         raise NotImplementedError("num_splits != 1 is not yet supported by the Triton/AMD backend")
@@ -321,5 +390,8 @@ def flash_attn_varlen_func(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        score_mod,
+        mask_mod,
+        score_mod_bwd,
     )
     return (o, lse) if return_lse else o

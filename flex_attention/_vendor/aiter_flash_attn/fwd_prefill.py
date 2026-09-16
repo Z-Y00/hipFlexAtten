@@ -307,6 +307,8 @@ def _attn_fwd_inner(
     WINDOW_SIZE_LEFT: tl.constexpr,
     WINDOW_SIZE_RIGHT: tl.constexpr,
     ACCUMULATOR_TYPE,
+    SCORE_MOD: tl.constexpr = None,
+    MASK_MOD: tl.constexpr = None,
 ):
     """
     Unified attention forward inner loop.
@@ -463,6 +465,19 @@ def _attn_fwd_inner(
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
             qk_scaled += bias
+
+        # score_mod / mask_mod: applied unconditionally (not gated by APPLY_MASK), since
+        # they're user-defined and may encode masking/positional info the block-skip
+        # logic above (computed from IS_CAUSAL/WINDOW alone) doesn't know about. Callers
+        # combining mask_mod with causal=True/window rely on the visited block range
+        # already covering everything mask_mod might keep -- true whenever mask_mod is
+        # at least as restrictive as causal/window, which is the intended usage (see
+        # flex_attention/interface.py).
+        if SCORE_MOD is not None:
+            qk_scaled = SCORE_MOD(qk_scaled, off_z, off_h_q, offs_m[:, None], kv_offs_n[None, :])
+        if MASK_MOD is not None:
+            keep = MASK_MOD(off_z, off_h_q, offs_m[:, None], kv_offs_n[None, :])
+            qk_scaled = tl.where(keep, qk_scaled, float("-inf"))
 
         # get max scores so far
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
@@ -997,6 +1012,8 @@ def attn_fwd(
     FORCE_MASKING: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
     HEAD_STRIDE_ALIGNED_8: tl.constexpr = False,
+    SCORE_MOD: tl.constexpr = None,
+    MASK_MOD: tl.constexpr = None,
 ):
     # set params
     ACCUMULATOR_TYPE = tl.float32
@@ -1264,6 +1281,8 @@ def attn_fwd(
             WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            SCORE_MOD=SCORE_MOD,
+            MASK_MOD=MASK_MOD,
         )
 
     # ========== Process FULL K Blocks (Fast Path) ==========
@@ -1331,6 +1350,8 @@ def attn_fwd(
             WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            SCORE_MOD=SCORE_MOD,
+            MASK_MOD=MASK_MOD,
         )
 
     # ========== Process MASKED K Blocks in the back ==========
@@ -1403,6 +1424,8 @@ def attn_fwd(
             WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
             WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+            SCORE_MOD=SCORE_MOD,
+            MASK_MOD=MASK_MOD,
         )
 
     # ============================================================
@@ -1504,6 +1527,9 @@ def attention_forward_prefill_triton_impl(
     rotary_sin: torch.Tensor | None = None,
     rotary_interleaved: bool = False,
     seqlens_rotary: torch.Tensor | None = None,
+    # score_mod / mask_mod (Phase 3, flex_attention-specific -- not upstream AITER)
+    score_mod=None,
+    mask_mod=None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -1947,4 +1973,6 @@ def attention_forward_prefill_triton_impl(
         FORCE_MASKING=force_masking,
         NUM_XCD=num_xcd,
         HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
+        SCORE_MOD=score_mod,
+        MASK_MOD=mask_mod,
     )
