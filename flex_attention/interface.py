@@ -7,10 +7,10 @@ NOTICE for details). See /home/lorri/.claude/plans/piped-painting-nebula.md for 
 overall port plan.
 
 Supported: causal, varlen, GQA/MQA, sliding window, return_lse, forward+backward
-(Phase 1); score_mod / mask_mod / score_mod_bwd (Phase 3); MLA and other large or
-asymmetric head dims up to 576/512 (Phase 4). Still unsupported, each raising a clear
-NotImplementedError: softcap and learnable_sink (Phase 2), qv / gather_kv_indices
-(top-k sparse KV), and block_sparse_tensors (Phase 5).
+(Phase 1); softcap and learnable_sink (Phase 2); score_mod / mask_mod / score_mod_bwd
+(Phase 3); MLA and other large or asymmetric head dims up to 576/512 (Phase 4). Still
+unsupported, each raising a clear NotImplementedError: qv / gather_kv_indices (top-k
+sparse KV) and block_sparse_tensors (Phase 5).
 
 All supported features compose freely (causal with window_size, score_mod and MLA head
 dims together, and so on). Earlier revisions rejected several such combinations; those
@@ -28,6 +28,7 @@ from flex_attention._vendor.aiter_flash_attn.bwd import attention_backward_trito
 from flex_attention._vendor.aiter_flash_attn.fwd_prefill import (
     attention_forward_prefill_triton_impl,
 )
+from flex_attention.mods import make_softcap_score_mod
 
 __all__ = ["flash_attn_func", "flash_attn_varlen_func"]
 
@@ -63,9 +64,12 @@ def _check_unsupported(
             "gather_kv_indices (top-k sparse KV / MLA) is not yet supported by the Triton/AMD backend"
         )
     if learnable_sink is not None:
-        raise NotImplementedError("learnable_sink is not yet wired up in the Triton/AMD backend (Phase 2)")
-    if softcap != 0.0:
-        raise NotImplementedError("softcap is not yet supported by the Triton/AMD backend (Phase 2)")
+        if learnable_sink.dim() != 1:
+            raise ValueError(
+                f"learnable_sink must be a 1-D per-head tensor, got shape {tuple(learnable_sink.shape)}"
+            )
+        if not learnable_sink.is_floating_point():
+            raise ValueError(f"learnable_sink must be floating point, got {learnable_sink.dtype}")
     if aux_tensors is not None or aux_scalars is not None:
         raise NotImplementedError("aux_tensors/aux_scalars are only used by score_mod/mask_mod, unsupported for now")
     if block_sparse_tensors is not None or block_sparse_tensors_bwd is not None:
@@ -79,6 +83,13 @@ def _check_unsupported(
     # (see _sanitize_nonkdim in bwd.py).
     if score_mod_bwd is not None and score_mod is None:
         raise ValueError("score_mod_bwd was given without score_mod")
+    if softcap != 0.0 and score_mod is not None:
+        # softcap is itself implemented as a score_mod, and the kernel takes only one.
+        # Upstream FA-4 has the same restriction. Compose them yourself if you need both
+        # (see flex_attention.make_softcap_score_mod).
+        raise ValueError("softcap and score_mod cannot be used together")
+    if softcap < 0.0:
+        raise ValueError(f"softcap must be non-negative, got {softcap}")
     if score_mod is not None and score_mod_bwd is None and requires_grad:
         raise ValueError(
             "score_mod requires score_mod_bwd for the backward pass: score_mod is inlined "
@@ -106,6 +117,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         score_mod=None,
         mask_mod=None,
         score_mod_bwd=None,
+        learnable_sink=None,
     ):
         is_varlen = cu_seqlens_q is not None
         layout = "thd" if is_varlen else "bshd"
@@ -152,9 +164,10 @@ class _FlashAttnFunc(torch.autograd.Function):
             None,  # v_descale
             score_mod=score_mod,
             mask_mod=mask_mod,
+            learnable_sink=None if learnable_sink is None else learnable_sink.contiguous().float(),
         )
 
-        ctx.save_for_backward(q, k, v, o, softmax_lse, cu_seqlens_q, cu_seqlens_k)
+        ctx.save_for_backward(q, k, v, o, softmax_lse, cu_seqlens_q, cu_seqlens_k, learnable_sink)
         ctx.score_mod = score_mod
         ctx.mask_mod = mask_mod
         ctx.score_mod_bwd = score_mod_bwd
@@ -171,7 +184,7 @@ class _FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, _dlse_unused):
-        q, k, v, o, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        q, k, v, o, softmax_lse, cu_seqlens_q, cu_seqlens_k, learnable_sink = ctx.saved_tensors
         is_varlen = ctx.layout == "thd"
         if is_varlen:
             total_seqlen_q, nheads_q, _ = q.shape
@@ -219,8 +232,28 @@ class _FlashAttnFunc(torch.autograd.Function):
             mask_mod=ctx.mask_mod,
             score_mod_bwd=ctx.score_mod_bwd,
         )
-        # One None per non-tensor forward arg after q/k/v (15 total forward args).
-        return (dq, dk, dv) + (None,) * 12
+        # Gradient w.r.t. the sink logits. The sink is one extra softmax term with no
+        # value vector, so its probability is p_sink = exp(sink - lse) -- using the
+        # sink-inclusive LSE the forward already wrote -- and its score gradient is
+        # p_sink * (0 - delta), with the same delta = rowsum(o * do) the backward kernel
+        # just filled in. No kernel change is needed for this: dq/dk/dv are already
+        # correct because they recover p from that same sink-inclusive LSE.
+        dsink = None
+        if learnable_sink is not None:
+            lse = softmax_lse if not is_varlen else softmax_lse.unsqueeze(0)
+            d = delta if not is_varlen else delta.unsqueeze(0)
+            head_axis = 1  # (batch, nheads, seqlen) for dense; (1, nheads, total) varlen
+            sink_shaped = learnable_sink.float().reshape(
+                *[1 if i != head_axis else -1 for i in range(lse.dim())]
+            )
+            p_sink = torch.exp(sink_shaped - lse)
+            # Fully-masked rows carry lse = -inf -> p_sink = 0, which is what we want.
+            p_sink = torch.nan_to_num(p_sink, nan=0.0, posinf=0.0)
+            reduce_axes = tuple(i for i in range(lse.dim()) if i != head_axis)
+            dsink = -(p_sink * d).sum(dim=reduce_axes).to(learnable_sink.dtype)
+
+        # One None per non-tensor forward arg after q/k/v (16 total forward args).
+        return (dq, dk, dv) + (None,) * 12 + (dsink,)
 
 
 def flash_attn_func(
@@ -295,9 +328,12 @@ def flash_attn_func(
     if num_splits != 1:
         raise NotImplementedError("num_splits != 1 is not yet supported by the Triton/AMD backend")
 
+    if softcap != 0.0:
+        score_mod, score_mod_bwd = make_softcap_score_mod(softcap)
+
     o, lse = _FlashAttnFunc.apply(
         q, k, v, softmax_scale, causal, window_size, deterministic, return_lse,
-        None, None, None, None, score_mod, mask_mod, score_mod_bwd,
+        None, None, None, None, score_mod, mask_mod, score_mod_bwd, learnable_sink,
     )
     return (o, lse) if return_lse else o
 
@@ -361,6 +397,9 @@ def flash_attn_varlen_func(
     if num_splits != 1:
         raise NotImplementedError("num_splits != 1 is not yet supported by the Triton/AMD backend")
 
+    if softcap != 0.0:
+        score_mod, score_mod_bwd = make_softcap_score_mod(softcap)
+
     o, lse = _FlashAttnFunc.apply(
         q,
         k,
@@ -377,5 +416,6 @@ def flash_attn_varlen_func(
         score_mod,
         mask_mod,
         score_mod_bwd,
+        learnable_sink,
     )
     return (o, lse) if return_lse else o

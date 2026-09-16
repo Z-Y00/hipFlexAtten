@@ -3,6 +3,7 @@ from flex_attention.mods import (
     causal_mask_mod,
     identity_score_mod_bwd,
     make_sliding_window_mask_mod,
+    make_softcap_score_mod,
 )
 
 __all__ = [
@@ -11,4 +12,5 @@ __all__ = [
     "causal_mask_mod",
     "identity_score_mod_bwd",
     "make_sliding_window_mask_mod",
+    "make_softcap_score_mod",
 ]

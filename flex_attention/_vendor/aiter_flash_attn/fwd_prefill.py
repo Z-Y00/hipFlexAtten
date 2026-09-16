@@ -375,6 +375,13 @@ def _attn_fwd_inner(
             qk = tl.dot(q, k, acc=qk)
         qk_scaled = qk * SM_SCALE
 
+        # score_mod is applied PRE-MASK, matching upstream FA-4 (its softcap is itself a
+        # "scoremod_premask_fn"). Order matters: applied after masking, a non-additive mod
+        # such as softcap would map the -inf of a masked position to a finite value
+        # (tanh(-inf) = -1) and silently un-mask it.
+        if SCORE_MOD is not None:
+            qk_scaled = SCORE_MOD(qk_scaled, off_z, off_h_q, offs_m[:, None], kv_offs_n[None, :])
+
         if USE_ALIBI:
             # compute the global position of each token within the sequence
             q_offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -467,15 +474,9 @@ def _attn_fwd_inner(
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
             qk_scaled += bias
 
-        # score_mod / mask_mod: applied unconditionally (not gated by APPLY_MASK), since
-        # they're user-defined and may encode masking/positional info the block-skip
-        # logic above (computed from IS_CAUSAL/WINDOW alone) doesn't know about. Callers
-        # combining mask_mod with causal=True/window rely on the visited block range
-        # already covering everything mask_mod might keep -- true whenever mask_mod is
-        # at least as restrictive as causal/window, which is the intended usage (see
-        # flex_attention/interface.py).
-        if SCORE_MOD is not None:
-            qk_scaled = SCORE_MOD(qk_scaled, off_z, off_h_q, offs_m[:, None], kv_offs_n[None, :])
+        # mask_mod applied unconditionally (not gated by APPLY_MASK): it is user-defined
+        # and may mask positions the block-skip logic, which only knows about
+        # IS_CAUSAL/WINDOW, still visits.
         if MASK_MOD is not None:
             keep = MASK_MOD(off_z, off_h_q, offs_m[:, None], kv_offs_n[None, :])
             qk_scaled = tl.where(keep, qk_scaled, float("-inf"))
@@ -1015,6 +1016,9 @@ def attn_fwd(
     HEAD_STRIDE_ALIGNED_8: tl.constexpr = False,
     SCORE_MOD: tl.constexpr = None,
     MASK_MOD: tl.constexpr = None,
+    SINK=None,
+    stride_sink_h=0,
+    USE_SINK: tl.constexpr = False,
 ):
     # set params
     ACCUMULATOR_TYPE = tl.float32
@@ -1437,6 +1441,23 @@ def attn_fwd(
     # For invalid rows: m_i = -inf, l_i = 0, acc = 0.
     # We set l_i = 1.0 to avoid division by zero and ensure LSE = -inf.
     invalid_mask = m_i == float("-inf")
+
+    # flex_attention addition (Phase 2): learnable attention sink. The sink is one extra
+    # per-head logit competing in the softmax with no value vector behind it, so it only
+    # enters the denominator. Folding it in here -- after the KV loop, against the final
+    # row max -- rather than inside the loop leaves the online rescale untouched and
+    # fixes both the output and the LSE below in one place. A fully-masked row keeps
+    # m_i = -inf and must stay zero, hence the invalid_mask guard.
+    if USE_SINK:
+        sink_logit = tl.load(SINK + off_h_q * stride_sink_h).to(tl.float32)
+        m_i_safe_sink = tl.where(invalid_mask, 0.0, m_i)
+        if USE_EXP2:
+            RCP_LN2_SINK: tl.constexpr = 1.4426950408889634
+            sink_term = tl.math.exp2((sink_logit - m_i_safe_sink) * RCP_LN2_SINK)
+        else:
+            sink_term = tl.math.exp(sink_logit - m_i_safe_sink)
+        l_i = l_i + tl.where(invalid_mask, 0.0, sink_term)
+
     l_i_safe = tl.where(invalid_mask, 1.0, l_i)
     l_recip = 1 / l_i_safe[:, None]
     acc = acc * l_recip
@@ -1446,12 +1467,16 @@ def attn_fwd(
         acc = acc * dropout_scale
 
     # compute log-sum-exp
+    # NOTE: l_i here already includes the sink term when USE_SINK, so the LSE written
+    # out is the sink-inclusive normalizer. The backward relies on that: it recovers
+    # p = exp(qk - lse), which is then automatically sink-normalized, so dq/dk/dv need
+    # no sink-specific kernel change at all.
     if USE_EXP2:
         RCP_LN2: tl.constexpr = 1.4426950408889634
         LN2: tl.constexpr = 0.6931471824645996
-        softmax_lse = (m_i * RCP_LN2 + tl.math.log2(l_i)) * LN2
+        softmax_lse = (m_i * RCP_LN2 + tl.math.log2(l_i_safe)) * LN2
     else:
-        softmax_lse = m_i + tl.math.log(l_i)
+        softmax_lse = m_i + tl.math.log(l_i_safe)
 
     # Ensure invalid rows have LSE = -inf
     softmax_lse = tl.where(invalid_mask, float("-inf"), softmax_lse)
@@ -1528,9 +1553,11 @@ def attention_forward_prefill_triton_impl(
     rotary_sin: torch.Tensor | None = None,
     rotary_interleaved: bool = False,
     seqlens_rotary: torch.Tensor | None = None,
-    # score_mod / mask_mod (Phase 3, flex_attention-specific -- not upstream AITER)
+    # score_mod / mask_mod (Phase 3) and learnable_sink (Phase 2):
+    # flex_attention-specific, not upstream AITER
     score_mod=None,
     mask_mod=None,
+    learnable_sink=None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -2005,5 +2032,8 @@ def attention_forward_prefill_triton_impl(
         HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
         SCORE_MOD=score_mod,
         MASK_MOD=mask_mod,
+        SINK=learnable_sink,
+        stride_sink_h=0 if learnable_sink is None else learnable_sink.stride(0),
+        USE_SINK=learnable_sink is not None,
         **block_overrides,
     )
