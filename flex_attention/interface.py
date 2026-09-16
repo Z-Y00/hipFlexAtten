@@ -8,9 +8,10 @@ overall port plan.
 
 Supported: causal, varlen, GQA/MQA, sliding window, return_lse, forward+backward
 (Phase 1); softcap and learnable_sink (Phase 2); score_mod / mask_mod / score_mod_bwd
-(Phase 3); MLA and other large or asymmetric head dims up to 576/512 (Phase 4). Still
-unsupported, each raising a clear NotImplementedError: qv / gather_kv_indices (top-k
-sparse KV) and block_sparse_tensors (Phase 5).
+(Phase 3); MLA and other large or asymmetric head dims up to 576/512 (Phase 4);
+block-sparse attention (Phase 5, dense layout only). Still unsupported, raising a clear
+NotImplementedError: qv / gather_kv_indices (top-k sparse KV), num_splits > 1, and
+block-sparse under varlen.
 
 All supported features compose freely (causal with window_size, score_mod and MLA head
 dims together, and so on). Earlier revisions rejected several such combinations; those
@@ -28,6 +29,7 @@ from flex_attention._vendor.aiter_flash_attn.bwd import attention_backward_trito
 from flex_attention._vendor.aiter_flash_attn.fwd_prefill import (
     attention_forward_prefill_triton_impl,
 )
+from flex_attention.block_sparse import backward_block_sparse
 from flex_attention.mods import make_softcap_score_mod
 
 __all__ = ["flash_attn_func", "flash_attn_varlen_func"]
@@ -72,8 +74,17 @@ def _check_unsupported(
             raise ValueError(f"learnable_sink must be floating point, got {learnable_sink.dtype}")
     if aux_tensors is not None or aux_scalars is not None:
         raise NotImplementedError("aux_tensors/aux_scalars are only used by score_mod/mask_mod, unsupported for now")
-    if block_sparse_tensors is not None or block_sparse_tensors_bwd is not None:
-        raise NotImplementedError("block_sparse_tensors is not yet supported by the Triton/AMD backend (Phase 5)")
+    if block_sparse_tensors is not None:
+        # block_sparse_tensors_bwd is accepted for signature compatibility but ignored:
+        # the backward direction is derived from the forward lists (see
+        # flex_attention.block_sparse.transpose_block_sparse).
+        q_bs, kv_bs = block_sparse_tensors.block_size
+        if head_dim_qk != head_dim_v:
+            raise NotImplementedError(
+                "block_sparse_tensors with head_dim_qk != head_dim_v is not supported"
+            )
+        if q_bs <= 0 or kv_bs <= 0:
+            raise ValueError(f"block_sparse block_size must be positive, got {(q_bs, kv_bs)}")
 
     # NOTE: causal + window_size, causal + score_mod/mask_mod, and asymmetric head dims
     # with causal/deterministic were all rejected here previously. They now work: the
@@ -118,8 +129,11 @@ class _FlashAttnFunc(torch.autograd.Function):
         mask_mod=None,
         score_mod_bwd=None,
         learnable_sink=None,
+        block_sparse=None,
     ):
         is_varlen = cu_seqlens_q is not None
+        if block_sparse is not None and is_varlen:
+            raise NotImplementedError("block_sparse is not supported with varlen yet")
         layout = "thd" if is_varlen else "bshd"
         window_size_left, window_size_right = _resolve_window(window_size)
         head_dim = q.shape[-1]
@@ -165,6 +179,7 @@ class _FlashAttnFunc(torch.autograd.Function):
             score_mod=score_mod,
             mask_mod=mask_mod,
             learnable_sink=None if learnable_sink is None else learnable_sink.contiguous().float(),
+            block_sparse=block_sparse,
         )
 
         ctx.save_for_backward(q, k, v, o, softmax_lse, cu_seqlens_q, cu_seqlens_k, learnable_sink)
@@ -180,6 +195,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         ctx.max_seqlen_k = max_seqlen_k
         ctx.return_lse = return_lse
         ctx.deterministic = deterministic
+        ctx.block_sparse = block_sparse
         return (o, softmax_lse) if return_lse else (o, None)
 
     @staticmethod
@@ -204,6 +220,15 @@ class _FlashAttnFunc(torch.autograd.Function):
         # mode, which this project never uses). AITER's "split" mode is strictly worse
         # here on every axis, so `deterministic` needs no separate path.
         mode = "fused"
+
+        # Block-sparse backward lists. dQ sweeps KV blocks per Q block (the forward
+        # direction); dK/dV sweeps Q blocks per KV block (its transpose). Both use the
+        # combined full+partial list -- see combine_block_sparse for why.
+        bs_dq = bs_dkdv = None
+        if ctx.block_sparse is not None:
+            _, kv_bs = ctx.block_sparse.block_size
+            num_kv_blocks = (k.shape[1] + kv_bs - 1) // kv_bs
+            bs_dq, bs_dkdv = backward_block_sparse(ctx.block_sparse, num_kv_blocks)
 
         attention_backward_triton_impl(
             do=do.contiguous(),
@@ -231,6 +256,8 @@ class _FlashAttnFunc(torch.autograd.Function):
             score_mod=ctx.score_mod,
             mask_mod=ctx.mask_mod,
             score_mod_bwd=ctx.score_mod_bwd,
+            block_sparse_dkdv=bs_dkdv,
+            block_sparse_dq=bs_dq,
         )
         # Gradient w.r.t. the sink logits. The sink is one extra softmax term with no
         # value vector, so its probability is p_sink = exp(sink - lse) -- using the
@@ -252,8 +279,8 @@ class _FlashAttnFunc(torch.autograd.Function):
             reduce_axes = tuple(i for i in range(lse.dim()) if i != head_axis)
             dsink = -(p_sink * d).sum(dim=reduce_axes).to(learnable_sink.dtype)
 
-        # One None per non-tensor forward arg after q/k/v (16 total forward args).
-        return (dq, dk, dv) + (None,) * 12 + (dsink,)
+        # One None per non-tensor forward arg after q/k/v.
+        return (dq, dk, dv) + (None,) * 12 + (dsink, None)
 
 
 def flash_attn_func(
@@ -334,6 +361,7 @@ def flash_attn_func(
     o, lse = _FlashAttnFunc.apply(
         q, k, v, softmax_scale, causal, window_size, deterministic, return_lse,
         None, None, None, None, score_mod, mask_mod, score_mod_bwd, learnable_sink,
+        block_sparse_tensors,
     )
     return (o, lse) if return_lse else o
 
@@ -417,5 +445,6 @@ def flash_attn_varlen_func(
         mask_mod,
         score_mod_bwd,
         learnable_sink,
+        block_sparse_tensors,
     )
     return (o, lse) if return_lse else o

@@ -91,12 +91,11 @@ def test_unsupported_features_raise():
     """Only the genuinely unimplemented features should raise.
 
     softcap and learnable_sink landed in Phase 2 (tests/test_softcap.py, test_sink.py),
-    score_mod / mask_mod in Phase 3 (test_score_mod.py), so they are absent here.
+    score_mod / mask_mod in Phase 3 (test_score_mod.py), and block_sparse_tensors in
+    Phase 5 (test_block_sparse.py), so they are absent here.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     q = k = v = torch.randn(1, 8, 2, 32, device=device)
-    with pytest.raises(NotImplementedError):
-        flash_attn_func(q, k, v, block_sparse_tensors=object())
     with pytest.raises(NotImplementedError):
         flash_attn_func(q, k, v, qv=q)
     with pytest.raises(NotImplementedError):

@@ -93,6 +93,16 @@ and worth reporting upstream.
   compile time. Passing `None` compiles them away entirely, so the default path is
   unchanged (benchmarks confirm).
 
+- **Block-sparse iteration** (Phase 5). `attn_fwd` and `bwd_kernel_fused_noncausal`
+  can walk an explicit per-`(batch, head, block)` list of block indices instead of a
+  contiguous range (`BLOCK_SPARSE` constexpr). The forward runs two passes -- fully
+  unmasked blocks with masking disabled, then partial blocks with `mask_mod` -- while
+  the backward walks one combined list per direction. Because the index jumps, the
+  sparse path recomputes tile pointers each iteration rather than incrementing them,
+  and bounds tiles by `seqlen` rather than by a contiguous block end. Tile sizes are
+  pinned to the sparsity granularity (the autotuner is bypassed), which is why the
+  sparse path is not a drop-in win for causal -- see `bench/bench_block_sparse.py`.
+
 - **LDS capping for MLA head dims** (Phase 4). MLA shapes overflow CDNA3's 64 KiB LDS
   with AITER's tuned block size of 128. Both wrappers compute a head-dim-aware cap
   (`max_block_for_lds` in `utils.py`) and, when it binds, bypass the autotuner to launch

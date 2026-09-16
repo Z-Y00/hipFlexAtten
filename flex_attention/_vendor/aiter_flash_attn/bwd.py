@@ -2917,6 +2917,8 @@ def _bwd_dkdv_inner(
     SCORE_MOD: tl.constexpr = None,
     MASK_MOD: tl.constexpr = None,
     SCORE_MOD_BWD: tl.constexpr = None,
+    SPARSE_IDX=None,
+    BLOCK_SPARSE: tl.constexpr = False,
 ):
     # if HEAD_DIM is padded
     PADDED_HEAD_QK: tl.constexpr = ACTUAL_HEAD_DIM_QK != HEAD_DIM_QK
@@ -2935,15 +2937,25 @@ def _bwd_dkdv_inner(
     do_ptrs = DO + offs_m[:, None] * stride_dom + offs_k_v[None, :] * stride_dok
     # BLOCK_N must be a multiple of BLOCK_M, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_N % BLOCK_M == 0)
-    curr_m = start_m
     step_m = BLOCK_M
     curr_philox_offset = batch_philox_offset
     RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
 
     for blk_idx in tl.range(num_steps, num_stages=1):
+        # BLOCK_SPARSE walks an explicit list of Q-block indices for this KV block
+        # (the transpose of the forward list) instead of a contiguous run.
+        if BLOCK_SPARSE:
+            curr_m = tl.load(SPARSE_IDX + blk_idx).to(tl.int32) * BLOCK_M
+        else:
+            curr_m = start_m + blk_idx * step_m
         if DEBUG_TRITON:
             print(f"iter {blk_idx}: curr_m = {curr_m}")
         offs_m = curr_m + tl.arange(0, BLOCK_M)
+        if BLOCK_SPARSE:
+            # Pointers are incremented linearly in the dense path; a jumping index needs
+            # them recomputed from the current block instead.
+            qT_ptrs = Q + offs_m[None, :] * stride_qm + offs_k_qk[:, None] * stride_qk
+            do_ptrs = DO + offs_m[:, None] * stride_dom + offs_k_v[None, :] * stride_dok
         # update the mask because offs_m advanced
         mask_m = offs_m < seqlen_q
         mask_qT = mask_m[None, :]
@@ -3087,10 +3099,10 @@ def _bwd_dkdv_inner(
             dk += tl.trans(tl.dot(qT, dsT_transposed)) * descale_q
         else:
             dk = tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT), acc=dk)
-        # Increment pointers.
-        curr_m += step_m
-        qT_ptrs += step_m * stride_qm
-        do_ptrs += step_m * stride_dom
+        # Increment pointers (dense path only; the sparse path recomputes them above).
+        if not BLOCK_SPARSE:
+            qT_ptrs += step_m * stride_qm
+            do_ptrs += step_m * stride_dom
     return dk, dv
 
 
@@ -3153,6 +3165,8 @@ def _bwd_dq_inner(
     SCORE_MOD: tl.constexpr = None,
     MASK_MOD: tl.constexpr = None,
     SCORE_MOD_BWD: tl.constexpr = None,
+    SPARSE_IDX=None,
+    BLOCK_SPARSE: tl.constexpr = False,
 ):
     # if HEAD_DIM is padded
     PADDED_HEAD_QK: tl.constexpr = ACTUAL_HEAD_DIM_QK != HEAD_DIM_QK
@@ -3172,17 +3186,27 @@ def _bwd_dq_inner(
     Di = tl.load(Delta + offs_m * stride_delta_m, mask=mask_m, other=0.0)
     # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
-    curr_n = start_n
     step_n = BLOCK_N2
     curr_philox_offset = batch_philox_offset
     RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
     for blk_idx in tl.range(num_steps, num_stages=1):
+        # BLOCK_SPARSE walks an explicit list of KV-block indices for this Q block.
+        if BLOCK_SPARSE:
+            curr_n = tl.load(SPARSE_IDX + blk_idx).to(tl.int32) * BLOCK_N2
+        else:
+            curr_n = start_n + blk_idx * step_n
         if DEBUG_TRITON:
             print(f"iter {blk_idx}: curr_n = {curr_n}")
         offs_n = curr_n + tl.arange(0, BLOCK_N2)
-        # end_n is needed because the end of causal True might not be perfectly
-        # aligned with the end of the block
-        mask_n = offs_n < end_n
+        if BLOCK_SPARSE:
+            kT_ptrs = K + offs_n[None, :] * stride_kn + offs_k_qk[:, None] * stride_kk
+            vT_ptrs = V + offs_n[None, :] * stride_vn + offs_k_v[:, None] * stride_vk
+            # A sparse block list has no contiguous end; bound by seqlen instead.
+            mask_n = offs_n < seqlen_k
+        else:
+            # end_n is needed because the end of causal True might not be perfectly
+            # aligned with the end of the block
+            mask_n = offs_n < end_n
         if DEBUG_TRITON_DETAIL:
             print(
                 f"start_n = {start_n}, end_n = {end_n}, offs_n: {offs_n.shape}\n{offs_n}"
@@ -3191,7 +3215,10 @@ def _bwd_dq_inner(
             print(f"mask_n: {mask_n.shape}\n{mask_n}")
         mask_kT = mask_n[None, :]
         mask_vT = mask_n[None, :]
-        mask_mn = mask_m[:, None] & (offs_n[None, :] < end_n)
+        if BLOCK_SPARSE:
+            mask_mn = mask_m[:, None] & (offs_n[None, :] < seqlen_k)
+        else:
+            mask_mn = mask_m[:, None] & (offs_n[None, :] < end_n)
         if PADDED_HEAD_QK:
             mask_kT &= offs_k_qk[:, None] < ACTUAL_HEAD_DIM_QK
         if PADDED_HEAD_V:
@@ -3302,10 +3329,10 @@ def _bwd_dq_inner(
             dq += tl.trans(tl.dot(kT, ds_transposed)) * descale_k
         else:
             dq = tl.dot(ds.to(kT.type.element_ty), tl.trans(kT), acc=dq)
-        # Increment pointers.
-        curr_n += step_n
-        kT_ptrs += step_n * stride_kn
-        vT_ptrs += step_n * stride_vn
+        # Increment pointers (dense path only; sparse recomputes them at loop top).
+        if not BLOCK_SPARSE:
+            kT_ptrs += step_n * stride_kn
+            vT_ptrs += step_n * stride_vn
     return dq
 
 
@@ -3490,6 +3517,23 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     SCORE_MOD: tl.constexpr = None,
     MASK_MOD: tl.constexpr = None,
     SCORE_MOD_BWD: tl.constexpr = None,
+    BS_DKDV_CNT=None,
+    BS_DKDV_IDX=None,
+    BS_DQ_CNT=None,
+    BS_DQ_IDX=None,
+    stride_bs_dkdv_cnt_b=0,
+    stride_bs_dkdv_cnt_h=0,
+    stride_bs_dkdv_cnt_m=0,
+    stride_bs_dkdv_idx_b=0,
+    stride_bs_dkdv_idx_h=0,
+    stride_bs_dkdv_idx_m=0,
+    stride_bs_dq_cnt_b=0,
+    stride_bs_dq_cnt_h=0,
+    stride_bs_dq_cnt_m=0,
+    stride_bs_dq_idx_b=0,
+    stride_bs_dq_idx_h=0,
+    stride_bs_dq_idx_m=0,
+    BLOCK_SPARSE: tl.constexpr = False,
 ):
     # program ids
     hkid = tl.program_id(0)
@@ -4134,6 +4178,23 @@ def bwd_kernel_fused_noncausal(
     SCORE_MOD: tl.constexpr = None,
     MASK_MOD: tl.constexpr = None,
     SCORE_MOD_BWD: tl.constexpr = None,
+    BS_DKDV_CNT=None,
+    BS_DKDV_IDX=None,
+    BS_DQ_CNT=None,
+    BS_DQ_IDX=None,
+    stride_bs_dkdv_cnt_b=0,
+    stride_bs_dkdv_cnt_h=0,
+    stride_bs_dkdv_cnt_m=0,
+    stride_bs_dkdv_idx_b=0,
+    stride_bs_dkdv_idx_h=0,
+    stride_bs_dkdv_idx_m=0,
+    stride_bs_dq_cnt_b=0,
+    stride_bs_dq_cnt_h=0,
+    stride_bs_dq_cnt_m=0,
+    stride_bs_dq_idx_b=0,
+    stride_bs_dq_idx_h=0,
+    stride_bs_dq_idx_m=0,
+    BLOCK_SPARSE: tl.constexpr = False,
 ):
     # program ids
     hkid = tl.program_id(0)
@@ -4267,6 +4328,23 @@ def bwd_kernel_fused_noncausal(
             else:
                 start_m = 0
                 num_steps = tl.cdiv(seqlen_q, BLOCK_M1)
+            # Block-sparse: this KV block only sees the Q blocks listed for it (the
+            # transpose of the forward list). pid indexes the KV block.
+            bs_dkdv_idx_ptr = BS_DKDV_IDX
+            if BLOCK_SPARSE:
+                _c = (
+                    bid * stride_bs_dkdv_cnt_b
+                    + hqid * stride_bs_dkdv_cnt_h
+                    + pid * stride_bs_dkdv_cnt_m
+                )
+                _i = (
+                    bid * stride_bs_dkdv_idx_b
+                    + hqid * stride_bs_dkdv_idx_h
+                    + pid * stride_bs_dkdv_idx_m
+                )
+                num_steps = tl.load(BS_DKDV_CNT + _c).to(tl.int32)
+                bs_dkdv_idx_ptr = BS_DKDV_IDX + _i
+                start_m = 0
             dk, dv = _bwd_dkdv_inner(
                 dk,
                 dv,  # output tensors
@@ -4320,6 +4398,8 @@ def bwd_kernel_fused_noncausal(
                 SCORE_MOD=SCORE_MOD,
                 MASK_MOD=MASK_MOD,
                 SCORE_MOD_BWD=SCORE_MOD_BWD,
+                SPARSE_IDX=bs_dkdv_idx_ptr,
+                BLOCK_SPARSE=BLOCK_SPARSE,
             )
 
         # Write back dV
@@ -4409,6 +4489,23 @@ def bwd_kernel_fused_noncausal(
                 start_n = 0
                 num_steps = tl.cdiv(seqlen_k, BLOCK_N2)
 
+            # Block-sparse: this Q block only sees the KV blocks listed for it.
+            bs_dq_idx_ptr = BS_DQ_IDX
+            if BLOCK_SPARSE:
+                _c = (
+                    bid * stride_bs_dq_cnt_b
+                    + hqid * stride_bs_dq_cnt_h
+                    + pid * stride_bs_dq_cnt_m
+                )
+                _i = (
+                    bid * stride_bs_dq_idx_b
+                    + hqid * stride_bs_dq_idx_h
+                    + pid * stride_bs_dq_idx_m
+                )
+                num_steps = tl.load(BS_DQ_CNT + _c).to(tl.int32)
+                bs_dq_idx_ptr = BS_DQ_IDX + _i
+                start_n = 0
+
             dq = tl.zeros([BLOCK_M2, HEAD_DIM_QK], dtype=tl.float32)
             dq = _bwd_dq_inner(  # noncausal fused dQ (score_mod/mask_mod path)
                 dq,
@@ -4465,6 +4562,8 @@ def bwd_kernel_fused_noncausal(
                 SCORE_MOD=SCORE_MOD,
                 MASK_MOD=MASK_MOD,
                 SCORE_MOD_BWD=SCORE_MOD_BWD,
+                SPARSE_IDX=bs_dq_idx_ptr,
+                BLOCK_SPARSE=BLOCK_SPARSE,
             )
             # Write back dQ.
             adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
@@ -4526,6 +4625,8 @@ def attention_backward_triton_impl(
     score_mod=None,
     mask_mod=None,
     score_mod_bwd=None,
+    block_sparse_dkdv=None,
+    block_sparse_dq=None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -4795,6 +4896,13 @@ def attention_backward_triton_impl(
     # score_mod/mask_mod are threaded through both fused kernels (causal and non-causal)
     # via _bwd_dkdv_inner / _bwd_dq_inner. The "split" and "fused_atomic" kernels use a
     # different pair of inner helpers that were not instrumented.
+    block_sparse = block_sparse_dkdv is not None
+    if block_sparse:
+        if mode != "fused" or causal:
+            raise NotImplementedError(
+                "block-sparse backward requires the non-causal fused path; express "
+                "causality through the block mask itself."
+            )
     has_mod = score_mod is not None or mask_mod is not None or score_mod_bwd is not None
     if has_mod and mode != "fused":
         raise NotImplementedError(
@@ -4911,7 +5019,19 @@ def attention_backward_triton_impl(
         ),
         default=0,
     )
-    if cap_block < tuned_block:
+    if block_sparse:
+        bs_q, bs_kv = block_sparse_dkdv.block_size
+        bwd_block_overrides = dict(
+            BLOCK_M1=bs_q,
+            BLOCK_N1=bs_kv,
+            BLOCK_M2=bs_q,
+            BLOCK_N2=bs_kv,
+            BLK_SLICE_FACTOR=1,
+            waves_per_eu=1,
+            num_stages=1,
+            num_warps=4,
+        )
+    elif cap_block < tuned_block:
         if cap_block == 0:
             raise ValueError(
                 f"head_dim {head_size_qk} (padded to {padded_d_model_qk}) is too large for "
@@ -5159,6 +5279,23 @@ def attention_backward_triton_impl(
                 SCORE_MOD=score_mod,
                 MASK_MOD=mask_mod,
                 SCORE_MOD_BWD=score_mod_bwd,
+                BS_DKDV_CNT=None if not block_sparse else block_sparse_dkdv.mask_block_cnt,
+                BS_DKDV_IDX=None if not block_sparse else block_sparse_dkdv.mask_block_idx,
+                BS_DQ_CNT=None if not block_sparse else block_sparse_dq.mask_block_cnt,
+                BS_DQ_IDX=None if not block_sparse else block_sparse_dq.mask_block_idx,
+                stride_bs_dkdv_cnt_b=0 if not block_sparse else block_sparse_dkdv.mask_block_cnt.stride(0),
+                stride_bs_dkdv_cnt_h=0 if not block_sparse else block_sparse_dkdv.mask_block_cnt.stride(1),
+                stride_bs_dkdv_cnt_m=0 if not block_sparse else block_sparse_dkdv.mask_block_cnt.stride(2),
+                stride_bs_dkdv_idx_b=0 if not block_sparse else block_sparse_dkdv.mask_block_idx.stride(0),
+                stride_bs_dkdv_idx_h=0 if not block_sparse else block_sparse_dkdv.mask_block_idx.stride(1),
+                stride_bs_dkdv_idx_m=0 if not block_sparse else block_sparse_dkdv.mask_block_idx.stride(2),
+                stride_bs_dq_cnt_b=0 if not block_sparse else block_sparse_dq.mask_block_cnt.stride(0),
+                stride_bs_dq_cnt_h=0 if not block_sparse else block_sparse_dq.mask_block_cnt.stride(1),
+                stride_bs_dq_cnt_m=0 if not block_sparse else block_sparse_dq.mask_block_cnt.stride(2),
+                stride_bs_dq_idx_b=0 if not block_sparse else block_sparse_dq.mask_block_idx.stride(0),
+                stride_bs_dq_idx_h=0 if not block_sparse else block_sparse_dq.mask_block_idx.stride(1),
+                stride_bs_dq_idx_m=0 if not block_sparse else block_sparse_dq.mask_block_idx.stride(2),
+                BLOCK_SPARSE=block_sparse,
                 **bwd_block_overrides,
             )
     elif mode == "fused_atomic":

@@ -310,6 +310,8 @@ def _attn_fwd_inner(
     ACCUMULATOR_TYPE,
     SCORE_MOD: tl.constexpr = None,
     MASK_MOD: tl.constexpr = None,
+    SPARSE_IDX=None,
+    BLOCK_SPARSE: tl.constexpr = False,
 ):
     """
     Unified attention forward inner loop.
@@ -324,8 +326,19 @@ def _attn_fwd_inner(
     # seqlen diff (only used when APPLY_MASK=True)
     seqlen_delta_qk = seqlen_k - seqlen_q
 
-    # loop over k, v, and update accumulator
-    for start_n in tl.range(block_min, block_max, BLOCK_N, num_stages=1):
+    # loop over k, v, and update accumulator.
+    # BLOCK_SPARSE walks an explicit list of KV block indices instead of a contiguous
+    # range; block_min/block_max then carry the iteration count rather than offsets.
+    if BLOCK_SPARSE:
+        n_iters = block_max
+    else:
+        n_iters = (block_max - block_min + BLOCK_N - 1) // BLOCK_N
+
+    for blk_i in tl.range(0, n_iters, num_stages=1):
+        if BLOCK_SPARSE:
+            start_n = tl.load(SPARSE_IDX + blk_i).to(tl.int32) * BLOCK_N
+        else:
+            start_n = block_min + blk_i * BLOCK_N
         # get ptrs
         k_ptrs = k_base_ptrs + start_n * stride_kn
         v_ptrs = v_base_ptrs + start_n * stride_vk
@@ -361,8 +374,12 @@ def _attn_fwd_inner(
         # setup qk accumulator
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
 
-        # Apply extra token masking for partial blocks (only when APPLY_MASK=True)
-        if APPLY_MASK and ((n_extra_tokens != 0) and (start_n + BLOCK_N == block_max)):
+        # Apply extra token masking for partial blocks (only when APPLY_MASK=True).
+        # -inf seeded into the accumulator survives the dot below (-inf + x = -inf).
+        if BLOCK_SPARSE:
+            # A sparse block list has no notion of "last block", so bound every block.
+            qk = tl.where(kv_offs_n[None, :] < seqlen_k, qk, float("-inf"))
+        elif APPLY_MASK and ((n_extra_tokens != 0) and (start_n + BLOCK_N == block_max)):
             boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
             size_n = start_n + offs_n[None, :]
             mask = size_n < boundary_m[:, None]
@@ -1019,6 +1036,21 @@ def attn_fwd(
     SINK=None,
     stride_sink_h=0,
     USE_SINK: tl.constexpr = False,
+    BS_MASK_CNT=None,
+    BS_MASK_IDX=None,
+    BS_FULL_CNT=None,
+    BS_FULL_IDX=None,
+    stride_bs_cnt_b=0,
+    stride_bs_cnt_h=0,
+    stride_bs_cnt_m=0,
+    stride_bs_idx_b=0,
+    stride_bs_idx_h=0,
+    stride_bs_idx_m=0,
+    stride_bs_fidx_b=0,
+    stride_bs_fidx_h=0,
+    stride_bs_fidx_m=0,
+    BLOCK_SPARSE: tl.constexpr = False,
+    BS_HAS_FULL: tl.constexpr = False,
 ):
     # set params
     ACCUMULATOR_TYPE = tl.float32
@@ -1104,6 +1136,32 @@ def attn_fwd(
     else:
         q_descale, k_descale, v_descale = 1.0, 1.0, 1.0
 
+    # Block-sparse: the visited KV blocks come from an explicit list, so the
+    # causal/window block geometry below is bypassed entirely.
+    bs_mask_cnt = 0
+    bs_full_cnt = 0
+    bs_mask_idx_ptr = BS_MASK_IDX
+    bs_full_idx_ptr = BS_FULL_IDX
+    if BLOCK_SPARSE:
+        cnt_off = (
+            off_z * stride_bs_cnt_b + off_h_q * stride_bs_cnt_h + start_m * stride_bs_cnt_m
+        )
+        idx_off = (
+            off_z * stride_bs_idx_b + off_h_q * stride_bs_idx_h + start_m * stride_bs_idx_m
+        )
+        bs_mask_cnt = tl.load(BS_MASK_CNT + cnt_off).to(tl.int32)
+        bs_mask_idx_ptr = BS_MASK_IDX + idx_off
+        if BS_HAS_FULL:
+            # The full list has its own max-entries dimension, so its strides differ
+            # from the partial list's; they cannot share an offset.
+            fidx_off = (
+                off_z * stride_bs_fidx_b
+                + off_h_q * stride_bs_fidx_h
+                + start_m * stride_bs_fidx_m
+            )
+            bs_full_cnt = tl.load(BS_FULL_CNT + cnt_off).to(tl.int32)
+            bs_full_idx_ptr = BS_FULL_IDX + fidx_off
+
     # figure out masking pattern
     (
         n_front_skip_blocks,
@@ -1126,7 +1184,10 @@ def attn_fwd(
     # ============================================================
     #          PROGRAM EARLY EXIT (All K Blocks Skipped)
     # ============================================================
-    total_visible_blocks = n_front_masked_blocks + n_full_blocks + n_back_masked_blocks
+    if BLOCK_SPARSE:
+        total_visible_blocks = bs_mask_cnt + bs_full_cnt
+    else:
+        total_visible_blocks = n_front_masked_blocks + n_full_blocks + n_back_masked_blocks
     if total_visible_blocks == 0:
         """
         No K blocks visible - write zeros and exit.
@@ -1224,49 +1285,57 @@ def attn_fwd(
 
     # ========== Process MASKED K Blocks in the front ==========
     # NOTE: we use USE_SLIDING_WINDOW as guard because the compiler will crash other wise. front masking is only for sliding window so that is fine.
-    if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
-        block_min = n_front_skip_blocks * BLOCK_N
-        block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
-
+    if BLOCK_SPARSE:
+        # Two passes over the explicit block lists: fully-unmasked blocks first (no
+        # masking work at all), then partial blocks with masking + mask_mod applied.
+        # block_min is unused in sparse mode; block_max carries the iteration count.
+        if BS_HAS_FULL:
+            acc, l_i, m_i = _attn_fwd_inner(
+                acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs,
+                stride_kn, stride_vk, stride_bn, stride_sn, stride_sm,
+                start_m, seqlen_k, seqlen_q,
+                dropout_p, philox_seed, philox_offset_base, SD_MASK,
+                stride_sz, stride_sh, off_z, off_h_q,
+                offs_m, offs_n, offs_d_qk, offs_d_v,
+                0, bs_full_cnt, 0, alibi_slope,
+                q_descale, k_descale, v_descale,
+                IS_FP8, FP8_MAX, FP8_P_DESCALE,
+                APPLY_MASK=False,
+                IS_CAUSAL=IS_CAUSAL,
+                BLOCK_M=BLOCK_M,
+                BLOCK_DMODEL_QK=BLOCK_DMODEL_QK,
+                BLOCK_DMODEL_V=BLOCK_DMODEL_V,
+                BLOCK_N=BLOCK_N,
+                PRE_LOAD_V=PRE_LOAD_V,
+                ENABLE_DROPOUT=ENABLE_DROPOUT,
+                PADDED_HEAD_QK=PADDED_HEAD_QK,
+                PADDED_HEAD_V=PADDED_HEAD_V,
+                ACTUAL_BLOCK_DMODEL_QK=ACTUAL_BLOCK_DMODEL_QK,
+                ACTUAL_BLOCK_DMODEL_V=ACTUAL_BLOCK_DMODEL_V,
+                SM_SCALE=SM_SCALE,
+                USE_ALIBI=USE_ALIBI,
+                USE_EXP2=USE_EXP2,
+                RETURN_SCORES=RETURN_SCORES,
+                USE_SLIDING_WINDOW=False,
+                WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
+                WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
+                ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+                SCORE_MOD=SCORE_MOD,
+                MASK_MOD=None,
+                SPARSE_IDX=bs_full_idx_ptr,
+                BLOCK_SPARSE=True,
+            )
         acc, l_i, m_i = _attn_fwd_inner(
-            acc,
-            l_i,
-            m_i,
-            q,
-            k_ptrs,
-            v_ptrs,
-            bias_ptrs,
-            stride_kn,
-            stride_vk,
-            stride_bn,
-            stride_sn,
-            stride_sm,
-            start_m,
-            seqlen_k,
-            seqlen_q,
-            dropout_p,
-            philox_seed,
-            philox_offset_base,
-            SD_MASK,
-            stride_sz,
-            stride_sh,
-            off_z,
-            off_h_q,
-            offs_m,
-            offs_n,
-            offs_d_qk,
-            offs_d_v,
-            block_min,  # Start of front masked blocks
-            block_max,  # End of front masked blocks
-            0,  # n_extra_tokens (0 for front blocks, only relevant for last block)
-            alibi_slope,
-            q_descale,
-            k_descale,
-            v_descale,
-            IS_FP8,
-            FP8_MAX,
-            FP8_P_DESCALE,
-            APPLY_MASK=True,  # Masked blocks
+            acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs,
+            stride_kn, stride_vk, stride_bn, stride_sn, stride_sm,
+            start_m, seqlen_k, seqlen_q,
+            dropout_p, philox_seed, philox_offset_base, SD_MASK,
+            stride_sz, stride_sh, off_z, off_h_q,
+            offs_m, offs_n, offs_d_qk, offs_d_v,
+            0, bs_mask_cnt, 0, alibi_slope,
+            q_descale, k_descale, v_descale,
+            IS_FP8, FP8_MAX, FP8_P_DESCALE,
+            APPLY_MASK=True,
             IS_CAUSAL=IS_CAUSAL,
             BLOCK_M=BLOCK_M,
             BLOCK_DMODEL_QK=BLOCK_DMODEL_QK,
@@ -1288,150 +1357,218 @@ def attn_fwd(
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
             SCORE_MOD=SCORE_MOD,
             MASK_MOD=MASK_MOD,
+            SPARSE_IDX=bs_mask_idx_ptr,
+            BLOCK_SPARSE=True,
         )
+    else:
+        if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
+            block_min = n_front_skip_blocks * BLOCK_N
+            block_max = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
 
-    # ========== Process FULL K Blocks (Fast Path) ==========
-    if n_full_blocks > 0:
-        block_min = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
-        block_max = (
-            n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
-        ) * BLOCK_N
+            acc, l_i, m_i = _attn_fwd_inner(
+                acc,
+                l_i,
+                m_i,
+                q,
+                k_ptrs,
+                v_ptrs,
+                bias_ptrs,
+                stride_kn,
+                stride_vk,
+                stride_bn,
+                stride_sn,
+                stride_sm,
+                start_m,
+                seqlen_k,
+                seqlen_q,
+                dropout_p,
+                philox_seed,
+                philox_offset_base,
+                SD_MASK,
+                stride_sz,
+                stride_sh,
+                off_z,
+                off_h_q,
+                offs_m,
+                offs_n,
+                offs_d_qk,
+                offs_d_v,
+                block_min,  # Start of front masked blocks
+                block_max,  # End of front masked blocks
+                0,  # n_extra_tokens (0 for front blocks, only relevant for last block)
+                alibi_slope,
+                q_descale,
+                k_descale,
+                v_descale,
+                IS_FP8,
+                FP8_MAX,
+                FP8_P_DESCALE,
+                APPLY_MASK=True,  # Masked blocks
+                IS_CAUSAL=IS_CAUSAL,
+                BLOCK_M=BLOCK_M,
+                BLOCK_DMODEL_QK=BLOCK_DMODEL_QK,
+                BLOCK_DMODEL_V=BLOCK_DMODEL_V,
+                BLOCK_N=BLOCK_N,
+                PRE_LOAD_V=PRE_LOAD_V,
+                ENABLE_DROPOUT=ENABLE_DROPOUT,
+                PADDED_HEAD_QK=PADDED_HEAD_QK,
+                PADDED_HEAD_V=PADDED_HEAD_V,
+                ACTUAL_BLOCK_DMODEL_QK=ACTUAL_BLOCK_DMODEL_QK,
+                ACTUAL_BLOCK_DMODEL_V=ACTUAL_BLOCK_DMODEL_V,
+                SM_SCALE=SM_SCALE,
+                USE_ALIBI=USE_ALIBI,
+                USE_EXP2=USE_EXP2,
+                RETURN_SCORES=RETURN_SCORES,
+                USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
+                WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
+                WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
+                ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+                SCORE_MOD=SCORE_MOD,
+                MASK_MOD=MASK_MOD,
+            )
 
-        acc, l_i, m_i = _attn_fwd_inner(
-            acc,
-            l_i,
-            m_i,
-            q,
-            k_ptrs,
-            v_ptrs,
-            bias_ptrs,
-            stride_kn,
-            stride_vk,
-            stride_bn,
-            stride_sn,
-            stride_sm,
-            start_m,
-            seqlen_k,
-            seqlen_q,
-            dropout_p,
-            philox_seed,
-            philox_offset_base,
-            SD_MASK,
-            stride_sz,
-            stride_sh,
-            off_z,
-            off_h_q,
-            offs_m,
-            offs_n,
-            offs_d_qk,
-            offs_d_v,
-            block_min,  # Start of range: 0
-            block_max,  # End of range: n_full_blocks * BLOCK_N
-            0,  # n_extra_tokens (not used for full blocks)
-            alibi_slope,
-            q_descale,
-            k_descale,
-            v_descale,
-            IS_FP8,
-            FP8_MAX,
-            FP8_P_DESCALE,
-            APPLY_MASK=FORCE_MASKING,
-            IS_CAUSAL=IS_CAUSAL,
-            BLOCK_M=BLOCK_M,
-            BLOCK_DMODEL_QK=BLOCK_DMODEL_QK,
-            BLOCK_DMODEL_V=BLOCK_DMODEL_V,
-            BLOCK_N=BLOCK_N,
-            PRE_LOAD_V=PRE_LOAD_V,
-            ENABLE_DROPOUT=ENABLE_DROPOUT,
-            PADDED_HEAD_QK=PADDED_HEAD_QK,
-            PADDED_HEAD_V=PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK=ACTUAL_BLOCK_DMODEL_QK,
-            ACTUAL_BLOCK_DMODEL_V=ACTUAL_BLOCK_DMODEL_V,
-            SM_SCALE=SM_SCALE,
-            USE_ALIBI=USE_ALIBI,
-            USE_EXP2=USE_EXP2,
-            RETURN_SCORES=RETURN_SCORES,
-            USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
-            WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
-            WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
-            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-            SCORE_MOD=SCORE_MOD,
-            MASK_MOD=MASK_MOD,
-        )
+        # ========== Process FULL K Blocks (Fast Path) ==========
+        if n_full_blocks > 0:
+            block_min = (n_front_skip_blocks + n_front_masked_blocks) * BLOCK_N
+            block_max = (
+                n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
+            ) * BLOCK_N
 
-    # ========== Process MASKED K Blocks in the back ==========
-    if n_back_masked_blocks > 0:
-        block_min = (
-            n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
-        ) * BLOCK_N
-        block_max = (
-            n_front_skip_blocks
-            + n_front_masked_blocks
-            + n_full_blocks
-            + n_back_masked_blocks
-        ) * BLOCK_N
+            acc, l_i, m_i = _attn_fwd_inner(
+                acc,
+                l_i,
+                m_i,
+                q,
+                k_ptrs,
+                v_ptrs,
+                bias_ptrs,
+                stride_kn,
+                stride_vk,
+                stride_bn,
+                stride_sn,
+                stride_sm,
+                start_m,
+                seqlen_k,
+                seqlen_q,
+                dropout_p,
+                philox_seed,
+                philox_offset_base,
+                SD_MASK,
+                stride_sz,
+                stride_sh,
+                off_z,
+                off_h_q,
+                offs_m,
+                offs_n,
+                offs_d_qk,
+                offs_d_v,
+                block_min,  # Start of range: 0
+                block_max,  # End of range: n_full_blocks * BLOCK_N
+                0,  # n_extra_tokens (not used for full blocks)
+                alibi_slope,
+                q_descale,
+                k_descale,
+                v_descale,
+                IS_FP8,
+                FP8_MAX,
+                FP8_P_DESCALE,
+                APPLY_MASK=FORCE_MASKING,
+                IS_CAUSAL=IS_CAUSAL,
+                BLOCK_M=BLOCK_M,
+                BLOCK_DMODEL_QK=BLOCK_DMODEL_QK,
+                BLOCK_DMODEL_V=BLOCK_DMODEL_V,
+                BLOCK_N=BLOCK_N,
+                PRE_LOAD_V=PRE_LOAD_V,
+                ENABLE_DROPOUT=ENABLE_DROPOUT,
+                PADDED_HEAD_QK=PADDED_HEAD_QK,
+                PADDED_HEAD_V=PADDED_HEAD_V,
+                ACTUAL_BLOCK_DMODEL_QK=ACTUAL_BLOCK_DMODEL_QK,
+                ACTUAL_BLOCK_DMODEL_V=ACTUAL_BLOCK_DMODEL_V,
+                SM_SCALE=SM_SCALE,
+                USE_ALIBI=USE_ALIBI,
+                USE_EXP2=USE_EXP2,
+                RETURN_SCORES=RETURN_SCORES,
+                USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
+                WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
+                WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
+                ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+                SCORE_MOD=SCORE_MOD,
+                MASK_MOD=MASK_MOD,
+            )
 
-        acc, l_i, m_i = _attn_fwd_inner(
-            acc,
-            l_i,
-            m_i,
-            q,
-            k_ptrs,
-            v_ptrs,
-            bias_ptrs,
-            stride_kn,
-            stride_vk,
-            stride_bn,
-            stride_sn,
-            stride_sm,
-            start_m,
-            seqlen_k,
-            seqlen_q,
-            dropout_p,
-            philox_seed,
-            philox_offset_base,
-            SD_MASK,
-            stride_sz,
-            stride_sh,
-            off_z,
-            off_h_q,
-            offs_m,
-            offs_n,
-            offs_d_qk,
-            offs_d_v,
-            block_min,  # Start of range: n_full_blocks * BLOCK_N
-            block_max,  # End of range: n_visible_k_blocks * BLOCK_N
-            n_extra_tokens,  # Padding tokens in last block
-            alibi_slope,
-            q_descale,
-            k_descale,
-            v_descale,
-            IS_FP8,
-            FP8_MAX,
-            FP8_P_DESCALE,
-            APPLY_MASK=True,  # Masked blocks
-            IS_CAUSAL=IS_CAUSAL,  # Use actual causal flag
-            BLOCK_M=BLOCK_M,
-            BLOCK_DMODEL_QK=BLOCK_DMODEL_QK,
-            BLOCK_DMODEL_V=BLOCK_DMODEL_V,
-            BLOCK_N=BLOCK_N,
-            PRE_LOAD_V=PRE_LOAD_V,
-            ENABLE_DROPOUT=ENABLE_DROPOUT,
-            PADDED_HEAD_QK=PADDED_HEAD_QK,
-            PADDED_HEAD_V=PADDED_HEAD_V,
-            ACTUAL_BLOCK_DMODEL_QK=ACTUAL_BLOCK_DMODEL_QK,
-            ACTUAL_BLOCK_DMODEL_V=ACTUAL_BLOCK_DMODEL_V,
-            SM_SCALE=SM_SCALE,
-            USE_ALIBI=USE_ALIBI,
-            USE_EXP2=USE_EXP2,
-            RETURN_SCORES=RETURN_SCORES,
-            USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
-            WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
-            WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
-            ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
-            SCORE_MOD=SCORE_MOD,
-            MASK_MOD=MASK_MOD,
-        )
+        # ========== Process MASKED K Blocks in the back ==========
+        if n_back_masked_blocks > 0:
+            block_min = (
+                n_front_skip_blocks + n_front_masked_blocks + n_full_blocks
+            ) * BLOCK_N
+            block_max = (
+                n_front_skip_blocks
+                + n_front_masked_blocks
+                + n_full_blocks
+                + n_back_masked_blocks
+            ) * BLOCK_N
+
+            acc, l_i, m_i = _attn_fwd_inner(
+                acc,
+                l_i,
+                m_i,
+                q,
+                k_ptrs,
+                v_ptrs,
+                bias_ptrs,
+                stride_kn,
+                stride_vk,
+                stride_bn,
+                stride_sn,
+                stride_sm,
+                start_m,
+                seqlen_k,
+                seqlen_q,
+                dropout_p,
+                philox_seed,
+                philox_offset_base,
+                SD_MASK,
+                stride_sz,
+                stride_sh,
+                off_z,
+                off_h_q,
+                offs_m,
+                offs_n,
+                offs_d_qk,
+                offs_d_v,
+                block_min,  # Start of range: n_full_blocks * BLOCK_N
+                block_max,  # End of range: n_visible_k_blocks * BLOCK_N
+                n_extra_tokens,  # Padding tokens in last block
+                alibi_slope,
+                q_descale,
+                k_descale,
+                v_descale,
+                IS_FP8,
+                FP8_MAX,
+                FP8_P_DESCALE,
+                APPLY_MASK=True,  # Masked blocks
+                IS_CAUSAL=IS_CAUSAL,  # Use actual causal flag
+                BLOCK_M=BLOCK_M,
+                BLOCK_DMODEL_QK=BLOCK_DMODEL_QK,
+                BLOCK_DMODEL_V=BLOCK_DMODEL_V,
+                BLOCK_N=BLOCK_N,
+                PRE_LOAD_V=PRE_LOAD_V,
+                ENABLE_DROPOUT=ENABLE_DROPOUT,
+                PADDED_HEAD_QK=PADDED_HEAD_QK,
+                PADDED_HEAD_V=PADDED_HEAD_V,
+                ACTUAL_BLOCK_DMODEL_QK=ACTUAL_BLOCK_DMODEL_QK,
+                ACTUAL_BLOCK_DMODEL_V=ACTUAL_BLOCK_DMODEL_V,
+                SM_SCALE=SM_SCALE,
+                USE_ALIBI=USE_ALIBI,
+                USE_EXP2=USE_EXP2,
+                RETURN_SCORES=RETURN_SCORES,
+                USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
+                WINDOW_SIZE_LEFT=WINDOW_SIZE_LEFT,
+                WINDOW_SIZE_RIGHT=WINDOW_SIZE_RIGHT,
+                ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
+                SCORE_MOD=SCORE_MOD,
+                MASK_MOD=MASK_MOD,
+            )
 
     # ============================================================
     #                        EPILOGUE
@@ -1558,6 +1695,7 @@ def attention_forward_prefill_triton_impl(
     score_mod=None,
     mask_mod=None,
     learnable_sink=None,
+    block_sparse=None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -1930,11 +2068,32 @@ def attention_forward_prefill_triton_impl(
     # more than one config is present, so that would silently miss AUTOTUNE=off), bypass
     # the autotuner and launch the raw JITFunction with a block size that fits. Normal
     # head dims never take this path, so the tuned fast path is untouched.
+    # Block-sparse requires the kernel tile to match the sparsity granularity exactly,
+    # so the autotuner is bypassed and the block sizes are pinned to block_size.
+    if block_sparse is not None:
+        bs_q, bs_kv = block_sparse.block_size
+        lds_cap = max_block_for_lds(padded_d_model_qk, q.element_size())
+        if lds_cap < bs_q:
+            raise ValueError(
+                f"block_sparse q block {bs_q} exceeds the LDS budget for head_dim "
+                f"{head_size_qk} on this GPU (max {lds_cap})"
+            )
+
     cap_block_m = max_block_for_lds(padded_d_model_qk, q.element_size())
     tuned_block_m = max(
         (c.kwargs.get("BLOCK_M", 0) for c in fwd_prefill_autotune_configs), default=0
     )
-    if cap_block_m < tuned_block_m:
+    if block_sparse is not None:
+        launcher = attn_fwd.fn[grid]
+        block_overrides = dict(
+            BLOCK_M=bs_q,
+            BLOCK_N=bs_kv,
+            waves_per_eu=2,
+            PRE_LOAD_V=False,
+            num_stages=1,
+            num_warps=4,
+        )
+    elif cap_block_m < tuned_block_m:
         if cap_block_m == 0:
             raise ValueError(
                 f"head_dim {head_size_qk} (padded to {padded_d_model_qk}) is too large for "
@@ -2035,5 +2194,20 @@ def attention_forward_prefill_triton_impl(
         SINK=learnable_sink,
         stride_sink_h=0 if learnable_sink is None else learnable_sink.stride(0),
         USE_SINK=learnable_sink is not None,
+        BS_MASK_CNT=None if block_sparse is None else block_sparse.mask_block_cnt,
+        BS_MASK_IDX=None if block_sparse is None else block_sparse.mask_block_idx,
+        BS_FULL_CNT=None if block_sparse is None else block_sparse.full_block_cnt,
+        BS_FULL_IDX=None if block_sparse is None else block_sparse.full_block_idx,
+        stride_bs_cnt_b=0 if block_sparse is None else block_sparse.mask_block_cnt.stride(0),
+        stride_bs_cnt_h=0 if block_sparse is None else block_sparse.mask_block_cnt.stride(1),
+        stride_bs_cnt_m=0 if block_sparse is None else block_sparse.mask_block_cnt.stride(2),
+        stride_bs_idx_b=0 if block_sparse is None else block_sparse.mask_block_idx.stride(0),
+        stride_bs_idx_h=0 if block_sparse is None else block_sparse.mask_block_idx.stride(1),
+        stride_bs_idx_m=0 if block_sparse is None else block_sparse.mask_block_idx.stride(2),
+        stride_bs_fidx_b=0 if (block_sparse is None or block_sparse.full_block_idx is None) else block_sparse.full_block_idx.stride(0),
+        stride_bs_fidx_h=0 if (block_sparse is None or block_sparse.full_block_idx is None) else block_sparse.full_block_idx.stride(1),
+        stride_bs_fidx_m=0 if (block_sparse is None or block_sparse.full_block_idx is None) else block_sparse.full_block_idx.stride(2),
+        BLOCK_SPARSE=block_sparse is not None,
+        BS_HAS_FULL=block_sparse is not None and block_sparse.full_block_cnt is not None,
         **block_overrides,
     )
