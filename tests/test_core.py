@@ -101,3 +101,52 @@ def test_unsupported_features_raise():
         flash_attn_func(q, k, v, qv=q)
     with pytest.raises(NotImplementedError):
         flash_attn_func(q, k, v, gather_kv_indices=torch.zeros(1, dtype=torch.int32, device=device))
+
+
+@needs_gpu
+@pytest.mark.parametrize("causal", [False, True])
+def test_backward_grid_covers_dq_phase(causal):
+    """Regression: the fused backward runs dK/dV and dQ off the same program id, striding
+    by BLOCK_N1 and BLOCK_M2 respectively. Upstream sized the grid by BLOCK_N1 alone, so
+    any config with BLOCK_M2 < BLOCK_N1 silently computed only the first
+    (seqlen/BLOCK_N1)*BLOCK_M2 rows of dQ and left the rest at zero.
+
+    Every config AITER ships happens to satisfy BLOCK_M2 >= BLOCK_N1, so this never fired
+    for them -- it is a trap for anyone adding configs. Force such a config and check dQ.
+    """
+    import triton
+
+    from flex_attention._vendor.aiter_flash_attn import bwd as bwd_mod
+
+    device = "cuda"
+    kern = bwd_mod.bwd_kernel_fused_causal if causal else bwd_mod.bwd_kernel_fused_noncausal
+    original = list(kern.configs)
+    try:
+        kern.configs = [
+            triton.Config(
+                {
+                    "BLOCK_M1": 32,
+                    "BLOCK_N1": 128,  # deliberately > BLOCK_M2
+                    "BLOCK_M2": 32,
+                    "BLOCK_N2": 32,
+                    "BLK_SLICE_FACTOR": 1,
+                    "waves_per_eu": 1,
+                },
+                num_stages=1,
+                num_warps=4,
+            )
+        ]
+        kern.cache.clear()
+        q, k, v = _rand_qkv(1, 512, 512, 4, 4, 64, torch.float16, device)
+        qr, kr, vr = [t.detach().clone().requires_grad_() for t in (q, k, v)]
+        out = flash_attn_func(q, k, v, causal=causal)
+        ref, _ = ref_attention_dense(qr, kr, vr, causal=causal)
+        do = torch.randn_like(out)  # random, not ones: a constant do makes dQ ~0
+        out.backward(do)
+        ref.backward(do)
+        # the tail rows are the ones the bug zeroed
+        assert q.grad[:, 256:].abs().max() > 0, "dQ tail is all zero -- grid does not cover dQ"
+        torch.testing.assert_close(q.grad.float(), qr.grad.float(), atol=1e-1, rtol=1e-1)
+    finally:
+        kern.configs = original
+        kern.cache.clear()

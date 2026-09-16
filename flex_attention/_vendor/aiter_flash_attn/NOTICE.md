@@ -86,6 +86,28 @@ and worth reporting upstream.
   under a different allocator layout, so it can silently corrupt instead of erroring.
   We never use this mode either, so this no longer constrains the public API.
 
+## Second upstream bug fixed here: backward grid does not cover the dQ phase
+
+The fused backward runs two phases off the same program id: dK/dV strides by `BLOCK_N1`,
+dQ by `BLOCK_M2`. Upstream sizes the launch grid by `BLOCK_N1` alone, so any config with
+`BLOCK_M2 < BLOCK_N1` computes only the first `(seqlen/BLOCK_N1) * BLOCK_M2` rows of dQ
+and leaves the rest at zero.
+
+Every config AITER ships happens to satisfy `BLOCK_M2 >= BLOCK_N1`, so the bug never
+fires upstream -- but it silently corrupts dQ for anyone adding a config, and it blocks
+otherwise-legal tile shapes from the autotune space. The `grid` closure now sizes by
+`min(BLOCK_N1, BLOCK_M2)`; both phases already guard their own program id, so
+over-provisioning is safe. `tests/test_core.py::test_backward_grid_covers_dq_phase`
+pins it by forcing such a config.
+
+**A measurement caveat worth repeating**: this bug was originally *hidden* by a bad
+benchmark. A config sweep that used `do = ones` as the upstream gradient reported
+1.33-1.39x "speedups" for configs that were really just skipping most of the dQ work --
+with a constant `do`, `dp - delta` nearly cancels, dQ becomes tiny, and an absolute error
+threshold accepts the truncated result. Always sweep a backward with a random upstream
+gradient and a relative error check. Re-measured properly, the backward's config-tuning
+headroom is only 1.02-1.05x.
+
 ## Other flex_attention changes
 
 - **`score_mod` / `mask_mod` / `score_mod_bwd`** (Phase 3) are threaded through

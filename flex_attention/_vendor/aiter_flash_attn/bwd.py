@@ -801,6 +801,49 @@ def _sanitize_nonkdim(configs):
 # Causal only: the non-causal kernel sweeps with the full BLOCK_M1 / BLOCK_N2 (there are
 # no diagonal blocks to slice), so its dots never hit the small-K miscompile and it keeps
 # the tuning hint. Applying this to both cost ~5% on non-causal for no correctness gain.
+def _extend_bwd_configs(configs):
+    """flex_attention addition: two extra backward tile shapes for the autotuner.
+
+    AITER ships 3 non-causal / 2 causal configs. A 216-point sweep on MI300X found these
+    two beat every shipped config on some shapes, but only by 1.02-1.05x -- the backward
+    is close to its config-tuning ceiling, and the remaining gap to peak is not reachable
+    by retiling.
+
+    (An earlier sweep appeared to show 1.33-1.39x. It was wrong: it used do=ones as the
+    upstream gradient, which makes dp - delta nearly cancel so dQ is tiny, and its
+    absolute error threshold then accepted configs that silently skipped most of the dQ
+    work -- the very grid bug fixed in the `grid` closure below. Re-run with a random do
+    and a relative check, the real headroom is a few percent. Kept as a warning: benchmark
+    a backward with a random upstream gradient, never a constant one.)
+    """
+    extra = [
+        # best non-causal and long-causal in the corrected sweep
+        (64, 128, 128, 64, 1, 1),
+        # best short-causal; BLOCK_M2 > BLOCK_N1 here, which only became legal once the
+        # grid covered both phases
+        (16, 64, 128, 32, 1, 2),
+    ]
+    out = list(configs)
+    for m1, n1, m2, n2, sf, wpe in extra:
+        out.append(
+            triton.Config(
+                {
+                    "BLOCK_M1": m1,
+                    "BLOCK_N1": n1,
+                    "BLOCK_M2": m2,
+                    "BLOCK_N2": n2,
+                    "BLK_SLICE_FACTOR": sf,
+                    "waves_per_eu": wpe,
+                },
+                num_stages=1,
+                num_warps=4,
+            )
+        )
+    return out
+
+
+causal_autotune_configs = _extend_bwd_configs(causal_autotune_configs)
+noncausal_autotune_configs = _extend_bwd_configs(noncausal_autotune_configs)
 causal_autotune_configs = _sanitize_nonkdim(causal_autotune_configs)
 
 
@@ -5072,11 +5115,17 @@ def attention_backward_triton_impl(
         else:
 
             def grid(META):
-                return (
-                    nheads_k,
-                    ((seqlen + META["BLOCK_N1"] - 1) // META["BLOCK_N1"]),
-                    batch,
-                )
+                # flex_attention fix: the fused backward runs two phases off the same
+                # program id -- dK/dV strides by BLOCK_N1, dQ by BLOCK_M2 -- so the grid
+                # must cover whichever needs more programs. Upstream sized it by BLOCK_N1
+                # alone, which silently computes only the first
+                # (seqlen/BLOCK_N1)*BLOCK_M2 rows of dQ whenever BLOCK_M2 < BLOCK_N1.
+                # Every config AITER ships happens to satisfy BLOCK_M2 >= BLOCK_N1, so
+                # the latent bug never fired for them; it blocks otherwise-faster tile
+                # shapes from the autotune space. Both phases already guard their own
+                # program id, so over-provisioning is safe.
+                step = min(META["BLOCK_N1"], META["BLOCK_M2"])
+                return (nheads_k, ((seqlen + step - 1) // step), batch)
 
         if causal:
 

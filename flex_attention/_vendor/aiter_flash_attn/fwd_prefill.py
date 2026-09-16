@@ -249,6 +249,37 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
 fwd_prefill_autotune_configs = get_fwd_prefill_configs(AUTOTUNE)
 
 
+def _extend_fwd_configs(configs):
+    """flex_attention addition: give the forward an actual autotune space.
+
+    AITER ships exactly ONE forward config even with AUTOTUNE=on, so nothing was being
+    tuned. A sweep of 144 configs on MI300X (BLOCK_M/N, waves_per_eu, PRE_LOAD_V,
+    num_warps, num_stages) found AITER's tile choice already optimal -- but PRE_LOAD_V=True
+    and num_stages=2 each won on some shapes, worth 2-6%. Add only those few variants:
+    every extra config is benchmarked on the first call for each new shape, so a large
+    space would cost more in warm-up than it returns.
+
+    Only applied when autotuning is enabled; AUTOTUNE=off keeps AITER's single config.
+    """
+    if AUTOTUNE != "on" or FWD_CONF_OVERRIDE is not None or len(configs) != 1:
+        return configs
+    base = configs[0]
+    extra = []
+    for pre_load_v in (True,):
+        for num_stages in (1, 2):
+            kwargs = dict(base.kwargs)
+            kwargs["PRE_LOAD_V"] = pre_load_v
+            extra.append(
+                triton.Config(
+                    kwargs, num_stages=num_stages, num_warps=base.num_warps
+                )
+            )
+    return configs + extra
+
+
+fwd_prefill_autotune_configs = _extend_fwd_configs(fwd_prefill_autotune_configs)
+
+
 @triton.jit
 def _attn_fwd_inner(
     acc,
