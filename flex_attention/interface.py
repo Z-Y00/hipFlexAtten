@@ -171,26 +171,16 @@ class _FlashAttnFunc(torch.autograd.Function):
             v,
             o,
             softmax_lse,
-            None,  # sd_mask
             softmax_scale,
-            None,  # alibi_slopes
             causal,
             window_size_left,
             window_size_right,
-            None,  # bias
             layout,
             cu_seqlens_q,
             cu_seqlens_k,
             max_seqlen_q if max_seqlen_q is not None else 0,
             max_seqlen_k if max_seqlen_k is not None else 0,
-            0.0,  # dropout_p
-            None,  # philox_seed
-            None,  # philox_offset
-            False,  # return_scores
             True,  # use_exp2
-            None,  # q_descale
-            None,  # k_descale
-            None,  # v_descale
             score_mod=score_mod,
             mask_mod=mask_mod,
             learnable_sink=None if learnable_sink is None else learnable_sink.contiguous().float(),
@@ -232,14 +222,12 @@ class _FlashAttnFunc(torch.autograd.Function):
         dk = torch.zeros_like(k)
         dv = torch.zeros_like(v)
 
-        # Always "fused": it is correct for causal and non-causal alike now that the
-        # matrix_instr_nonkdim miscompile is patched out (see _sanitize_nonkdim in
-        # bwd.py), it is the only mode carrying separate QK/V head dims, it is the only
-        # one supporting window_size, it is where score_mod/mask_mod are instrumented,
-        # and it is bitwise deterministic (atomics live in the separate "fused_atomic"
-        # mode, which this project never uses). AITER's "split" mode is strictly worse
-        # here on every axis, so `deterministic` needs no separate path.
-        mode = "fused"
+        # The backward always uses AITER's "fused" kernels (the only mode; "split" and
+        # "fused_atomic" were dead code and have been deleted): it is correct for causal
+        # and non-causal alike now that the matrix_instr_nonkdim miscompile is patched
+        # out (see _sanitize_nonkdim in bwd.py), it carries separate QK/V head dims,
+        # supports window_size, is where score_mod/mask_mod are instrumented, and is
+        # bitwise deterministic. So `deterministic` needs no separate path.
 
         # Block-sparse backward lists. dQ sweeps KV blocks per Q block (the forward
         # direction); dK/dV sweeps Q blocks per KV block (its transpose). Both use the
@@ -265,7 +253,6 @@ class _FlashAttnFunc(torch.autograd.Function):
             dv=dv,
             delta=delta,
             sm_scale=ctx.softmax_scale,
-            alibi_slopes=None,
             causal=ctx.causal,
             layout=ctx.layout,
             cu_seqlens_q=cu_seqlens_q,
@@ -273,7 +260,6 @@ class _FlashAttnFunc(torch.autograd.Function):
             max_seqlen_q=ctx.max_seqlen_q if ctx.max_seqlen_q is not None else q.shape[1],
             max_seqlen_k=ctx.max_seqlen_k if ctx.max_seqlen_k is not None else k.shape[1],
             use_exp2=True,
-            mode=mode,
             window_size_left=ctx.window_size_left,
             window_size_right=ctx.window_size_right,
             score_mod=ctx.score_mod,
