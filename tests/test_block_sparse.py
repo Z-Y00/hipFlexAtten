@@ -20,6 +20,7 @@ from flex_attention import (
     dense_to_block_sparse,
     flash_attn_func,
 )
+from flex_attention.block_sparse import BlockCategory
 
 needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -183,3 +184,72 @@ def test_block_sparse_varlen_matches_dense_varlen():
             got.grad.float(), want.grad.float(), atol=1e-2, rtol=1e-2,
             msg=lambda m, n=name: f"{n}: {m}",
         )
+
+
+# -- BlockCategory classification (pure host-side, no GPU needed) --
+
+
+def test_classify_causal_as_banded_not_sparse():
+    """A causal mask's diagonal blocks are a translation-invariant band, so they should
+    classify as CAUSAL rather than the fully-general PARTIAL_SPARSE bucket."""
+    bs = create_block_sparse_from_mask_mod(
+        lambda b, h, qi, ki: ki <= qi, batch=1, nheads=1, seqlen_q=256, seqlen_k=256,
+        block_size=(64, 64), device="cpu",
+    )
+    assert bs.causal is not None
+    assert bs.partial_dense is None
+    assert bs.partial_sparse is None
+    # lower-triangular block coverage for a 4x4 block grid: 4+3+2+1 visited blocks
+    assert (bs.mask_block_cnt + bs.full_block_cnt).sum() == 10
+
+
+def test_classify_dense_vs_sparse_partial_blocks():
+    """A partial block that's mostly kept classifies PARTIAL_DENSE; mostly masked
+    classifies PARTIAL_SPARSE -- neither is a diagonal band, so CAUSAL must stay empty."""
+    torch.manual_seed(0)
+    mostly_kept = torch.rand(64, 64) > 0.3  # ~70% kept
+    bs_dense = create_block_sparse_from_mask_mod(
+        lambda b, h, qi, ki: mostly_kept[qi % 64, ki % 64], batch=1, nheads=1,
+        seqlen_q=64, seqlen_k=64, block_size=(64, 64), device="cpu",
+    )
+    assert bs_dense.causal is None
+    assert bs_dense.partial_dense is not None
+    assert bs_dense.partial_sparse is None
+
+    torch.manual_seed(1)
+    mostly_masked = torch.rand(64, 64) > 0.85  # ~15% kept
+    bs_sparse = create_block_sparse_from_mask_mod(
+        lambda b, h, qi, ki: mostly_masked[qi % 64, ki % 64], batch=1, nheads=1,
+        seqlen_q=64, seqlen_k=64, block_size=(64, 64), device="cpu",
+    )
+    assert bs_sparse.causal is None
+    assert bs_sparse.partial_dense is None
+    assert bs_sparse.partial_sparse is not None
+
+
+def test_classify_full_and_empty_blocks():
+    """A block that's entirely kept is FULL; a block with nothing kept is EMPTY (never
+    materialized in any category's index list)."""
+    full = torch.zeros(1, 1, 2, 2, dtype=torch.bool)
+    partial = torch.zeros_like(full)
+    full[:, :, 0, 0] = True  # block (0,0): FULL
+    # block (0,1), (1,0), (1,1) left False in both -> EMPTY
+    bs = dense_to_block_sparse(full, partial, (64, 64))
+    assert bs.full_block_cnt.sum().item() == 1
+    assert bs.mask_block_cnt.sum().item() == 0
+    assert bs.causal is None and bs.partial_dense is None and bs.partial_sparse is None
+
+
+def test_backward_plan_drops_full_fast_path():
+    """The backward's combined/transposed plans fold FULL into the masked list and carry
+    no FULL fast path -- see BlockPlan.combined's docstring for why."""
+    from flex_attention.block_sparse import backward_block_sparse
+
+    bs = create_block_sparse_from_mask_mod(
+        lambda b, h, qi, ki: ki <= qi, batch=1, nheads=1, seqlen_q=256, seqlen_k=256,
+        block_size=(64, 64), device="cpu",
+    )
+    dq_plan, dkdv_plan = backward_block_sparse(bs, num_kv_blocks=4)
+    assert dq_plan.full is None and dkdv_plan.full is None
+    # every originally-visited (full or masked) block must survive the merge
+    assert dq_plan.mask_block_cnt.sum().item() == (bs.full_block_cnt + bs.mask_block_cnt).sum().item()
