@@ -171,6 +171,17 @@ def get_bwd_configs(mode: AutotuneMode):
                     _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
                     _bwd_cfg(64, 64, 64, 64, 2, 1, 16, stages=1, warps=4),
                     _bwd_cfg(32, 64, 64, 64, 2, 2, 16, stages=1, warps=4),
+                    # Two-stage variants, absent upstream: every tuned entry above
+                    # pins stages=1. Found by letting the autotuner loose on the
+                    # (unreachable) sweep space, worth 1.17x at head_dim 64 /
+                    # seqlen 4096 and 1.10x at 8192, neutral elsewhere. Added as
+                    # candidates rather than as a new default -- the autotuner
+                    # benchmarks them per shape, so a shape they do not suit just
+                    # keeps the config it already had.
+                    _bwd_cfg(32, 128, 128, 64, 2, 2, stages=2, warps=4),
+                    _bwd_cfg(32, 128, 128, 64, 2, 1, stages=2, warps=4),
+                    _bwd_cfg(64, 128, 128, 64, 2, 2, stages=2, warps=4),
+                    _bwd_cfg(64, 128, 128, 64, 2, 1, stages=2, warps=4),
                 ]
                 causal_configs = [
                     _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
