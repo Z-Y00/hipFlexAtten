@@ -905,6 +905,18 @@ def attn_fwd(
             )
             bs_full_cnt = tl.load(BS_FULL_CNT + cnt_off).to(tl.int32)
             bs_full_idx_ptr = BS_FULL_IDX + fidx_off
+        if NUM_SPLITS > 1:
+            # Split-KV over an explicit block list: hand each split a contiguous slice
+            # of the list. The contiguous path splits by KV *offset* (split_lo/split_hi),
+            # which a jumping index list cannot use -- without this every split would
+            # walk the whole list and recompute the entire result, costing NUM_SPLITS
+            # times the work for a bitwise-identical answer.
+            full_lo = (bs_full_cnt * split_id) // NUM_SPLITS
+            bs_full_cnt = (bs_full_cnt * (split_id + 1)) // NUM_SPLITS - full_lo
+            bs_full_idx_ptr = bs_full_idx_ptr + full_lo
+            mask_lo = (bs_mask_cnt * split_id) // NUM_SPLITS
+            bs_mask_cnt = (bs_mask_cnt * (split_id + 1)) // NUM_SPLITS - mask_lo
+            bs_mask_idx_ptr = bs_mask_idx_ptr + mask_lo
 
     # figure out masking pattern
     (
@@ -943,7 +955,10 @@ def attn_fwd(
         total_visible_blocks = bs_mask_cnt + bs_full_cnt
     else:
         total_visible_blocks = n_front_masked_blocks + n_full_blocks + n_back_masked_blocks
-    if NUM_SPLITS > 1 and split_hi <= split_lo:
+    # split_lo/split_hi partition the KV *offset* range, which only the contiguous path
+    # uses; block-sparse splits its index list instead (above), so an empty offset range
+    # says nothing about whether this split has list entries.
+    if (not BLOCK_SPARSE) and NUM_SPLITS > 1 and split_hi <= split_lo:
         total_visible_blocks = 0
     if total_visible_blocks == 0:
         """

@@ -91,3 +91,35 @@ def test_splits_validation():
     t = torch.randn(seqlen, nheads, head_dim, dtype=torch.bfloat16, device=device)
     with pytest.raises(NotImplementedError, match="varlen"):
         flash_attn_varlen_func(t, t, t, cu, cu, seqlen, seqlen, num_splits=4)
+
+
+@needs_gpu
+@pytest.mark.parametrize("num_splits", [2, 4, 8])
+def test_splits_partition_the_block_sparse_list(num_splits):
+    """Each split must take a slice of the block index list, not walk all of it.
+
+    split_lo/split_hi partition the KV *offset* range, which a jumping index list
+    cannot use -- so without an explicit slice every split recomputes the whole result.
+    That stayed correct (identical partials recombine to the same answer) while costing
+    num_splits times the work, so the giveaway was a bitwise-exact match rather than the
+    small reassociation difference a real split produces.
+    """
+    from flex_attention import dense_to_block_sparse
+
+    device = "cuda"
+    batch, nheads, head_dim, block, seqlen = 1, 2, 64, 64, 512
+    q, k, v = _qkv(batch, seqlen, nheads, head_dim, torch.bfloat16, device)
+    scale = head_dim**-0.5
+    nblk = seqlen // block
+    qb = torch.arange(nblk, device=device).view(1, 1, nblk, 1)
+    kb = torch.arange(nblk, device=device).view(1, 1, 1, nblk)
+    keep = (((qb * 5 + kb) % 3) == 0).expand(batch, nheads, nblk, nblk).contiguous()
+    bs = dense_to_block_sparse(keep, torch.zeros_like(keep), (block, block))
+
+    with torch.no_grad():
+        ref = flash_attn_func(q, k, v, softmax_scale=scale, block_sparse_tensors=bs)
+        out = flash_attn_func(
+            q, k, v, softmax_scale=scale, block_sparse_tensors=bs, num_splits=num_splits
+        )
+    torch.testing.assert_close(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+    assert torch.isfinite(out).all()
