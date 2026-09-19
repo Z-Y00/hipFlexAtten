@@ -340,3 +340,68 @@ def test_with_causal_drops_blocks_past_the_diagonal():
     assert causal.causal is not None  # the diagonal band is labelled as such
     # nothing above the diagonal survives
     assert int(causal.full.count.sum() + causal.masked.count.sum()) == 10
+
+
+@needs_gpu
+def test_causal_composes_with_block_sparse_under_varlen():
+    """Each sequence carries its own causal diagonal, so the intersection is per-sequence.
+
+    An all-blocks plan plus causal=True must reproduce the dense varlen causal kernel;
+    a ragged batch with no two sequences the same length is what would expose a single
+    shared offset being applied to all of them.
+    """
+    from flex_attention import create_block_sparse_varlen, flash_attn_varlen_func
+
+    device = "cuda"
+    nheads, head_dim = 2, 64
+    seqlens = [128, 192, 64]
+    cu = torch.tensor(
+        [0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32, device=device
+    )
+    total, max_s = cu[-1].item(), max(seqlens)
+    torch.manual_seed(0)
+    mk = lambda: (  # noqa: E731
+        torch.randn(total, nheads, head_dim, dtype=torch.bfloat16, device=device) * 0.3
+    ).requires_grad_()
+    q, k, v = mk(), mk(), mk()
+    qr, kr, vr = [t.detach().clone().requires_grad_() for t in (q, k, v)]
+    scale = head_dim**-0.5
+
+    # every block present; causal= must do all the narrowing
+    bs = create_block_sparse_varlen(
+        lambda b, h, qi, ki: ki == ki, cu, cu, nheads, block_size=(BLOCK, BLOCK)
+    )
+    out = flash_attn_varlen_func(
+        q, k, v, cu, cu, max_s, max_s, softmax_scale=scale,
+        causal=True, block_sparse_tensors=bs,
+    )
+    ref = flash_attn_varlen_func(
+        qr, kr, vr, cu, cu, max_s, max_s, softmax_scale=scale, causal=True
+    )
+    torch.testing.assert_close(out.float(), ref.float(), atol=1e-2, rtol=1e-2)
+
+    do = torch.randn_like(out)
+    out.backward(do)
+    ref.backward(do)
+    for got, want, name in [(q, qr, "dq"), (k, kr, "dk"), (v, vr, "dv")]:
+        torch.testing.assert_close(
+            got.grad.float(), want.grad.float(), atol=5e-2, rtol=5e-2,
+            msg=lambda m, n=name: f"{n}: {m}",
+        )
+
+
+def test_with_causal_varlen_uses_a_per_sequence_diagonal():
+    """Two sequences with different seqlen_k - seqlen_q must get different diagonals."""
+    cu_q = torch.tensor([0, 64, 192], dtype=torch.int32)   # lens 64, 128
+    cu_k = torch.tensor([0, 192, 320], dtype=torch.int32)  # lens 192, 128 -> offsets 128, 0
+    full = torch.ones(2, 1, 2, 3, dtype=torch.bool)
+    plan = dense_to_block_sparse(full, torch.zeros_like(full), (64, 64))
+    causal = plan.with_causal_varlen(cu_q, cu_k)
+    # offset +128: q block 0 sees kv blocks 0-1 fully, block 2 straddles
+    torch.testing.assert_close(
+        causal.full.to_dense(3)[0, 0, 0], torch.tensor([True, True, False])
+    )
+    # offset 0: the usual lower triangle, q block 0 sees nothing fully
+    torch.testing.assert_close(
+        causal.full.to_dense(3)[1, 0, 0], torch.tensor([False, False, False])
+    )

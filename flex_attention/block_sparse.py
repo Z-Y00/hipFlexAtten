@@ -52,6 +52,7 @@ __all__ = [
     "BlockSparseTensors",
     "backward_block_sparse",
     "causal_block_sparse",
+    "causal_block_sparse_varlen",
     "combine_block_sparse",
     "create_block_sparse_from_mask_mod",
     "create_block_sparse_varlen",
@@ -433,6 +434,20 @@ class BlockPlan:
         merged = BlockList.union([self.masked, self.full], num_kv_blocks)
         return BlockPlan(block_size=self.block_size, masked=merged)
 
+    def with_causal_varlen(
+        self, cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor
+    ) -> "BlockPlan":
+        """:meth:`with_causal` for the varlen (thd) layout.
+
+        Block indices are sequence-local and the grid is padded to the longest sequence,
+        so a single diagonal cannot describe the batch: each sequence has its own
+        ``seqlen_k - seqlen_q`` offset. Reclassify against a per-sequence offset instead.
+        """
+        offset = (
+            (cu_seqlens_k[1:] - cu_seqlens_k[:-1]) - (cu_seqlens_q[1:] - cu_seqlens_q[:-1])
+        ).to(torch.long).view(-1, 1, 1, 1)
+        return self._with_causal_offset(offset)
+
     def with_causal(self, seqlen_q: int, seqlen_k: int) -> "BlockPlan":
         """Intersect a bottom-right-aligned causal constraint into this plan.
 
@@ -454,16 +469,25 @@ class BlockPlan:
         would be stale. Surviving masked blocks are reported as CAUSAL where they meet
         the diagonal and PARTIAL_SPARSE elsewhere.
         """
+        return self._with_causal_offset(seqlen_k - seqlen_q)
+
+    def _with_causal_offset(self, offset) -> "BlockPlan":
+        """Shared body of :meth:`with_causal` / :meth:`with_causal_varlen`.
+
+        ``offset`` is ``seqlen_k - seqlen_q``: a scalar, or a per-sequence tensor shaped
+        to broadcast over ``[B, H, num_q_blocks, num_kv_blocks]``.
+        """
         q_bs, kv_bs = self.block_size
         nkv = self.num_kv_blocks
         nq = self.masked.index.shape[2]
         device = self.masked.index.device
-        offset = seqlen_k - seqlen_q
 
         q_blk = torch.arange(nq, device=device).view(nq, 1)
         kv_blk = torch.arange(nkv, device=device).view(1, nkv)
         q_first, q_last = q_blk * q_bs, q_blk * q_bs + q_bs - 1
         kv_first, kv_last = kv_blk * kv_bs, kv_blk * kv_bs + kv_bs - 1
+        # `offset` is a scalar for the dense layout and a per-sequence [B, 1, 1, 1]
+        # tensor under varlen, where every sequence has its own diagonal.
         fully_visible = kv_last <= q_first + offset
         fully_hidden = kv_first > q_last + offset
         straddling = ~fully_visible & ~fully_hidden
@@ -535,6 +559,27 @@ def causal_block_sparse(plan: BlockPlan, seqlen_q: int, seqlen_k: int) -> BlockP
     hit = slot.get(key)
     if hit is None:
         hit = plan.with_causal(seqlen_q, seqlen_k)
+        slot[key] = hit
+    return hit
+
+
+def causal_block_sparse_varlen(
+    plan: BlockPlan, cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor
+) -> BlockPlan:
+    """:meth:`BlockPlan.with_causal_varlen`, memoized per plan and cu_seqlens pair.
+
+    Keyed on the identity of the cu_seqlens tensors, so a caller that builds them once
+    alongside the plan -- the usual case, since both describe the same batching -- gets
+    the cached result. A caller that rebuilds cu_seqlens every step recomputes, which
+    costs a device sync (sizing the packed index tensor), so hold on to them.
+    """
+    slot = _cache_slot(plan.mask_block_idx)
+    key = ("causal_varlen",
+           id(plan.full_block_idx) if plan.full_block_idx is not None else None,
+           id(cu_seqlens_q), id(cu_seqlens_k))
+    hit = slot.get(key)
+    if hit is None:
+        hit = plan.with_causal_varlen(cu_seqlens_q, cu_seqlens_k)
         slot[key] = hit
     return hit
 
