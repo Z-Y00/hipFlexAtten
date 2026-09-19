@@ -194,6 +194,18 @@ def time_launch(launch, warmup: int = 3, reps: int = 7) -> float:
 def pick_knobs(cache: dict, key, candidates, launch):
     """Return the fastest candidate for ``key``, measuring once and caching the winner.
 
+    NOT YET VERIFIED TO PAY OFF. Correctness is established (the full suite passes with
+    it active on gfx942, and selection is one-time: one measurement over 50 calls). What
+    is missing is evidence that it is *faster* anywhere. On gfx942 it measures neutral,
+    0.94-1.01x over six shapes, which is expected there -- that architecture has little
+    headroom, and the forward simply re-picks the default, so both arms run identical
+    kernels. The case with real headroom is the gfx950 block-64 backward, where the
+    config this selects is worth 1.18-1.32x and no free rule can capture it (the same
+    setting is 1.41x slower at head_dim 128). That run is outstanding.
+    To settle it: bench/bench_pick_knobs.py on an MI355X node, against the AUTOTUNE=off
+    arm. If gfx950 does not show the win, drop this -- it would be the fourth mechanism
+    in this area whose overhead exceeded what it recovered.
+
     ``launch(candidate)`` must run the kernel; it is called repeatedly during selection,
     which is safe because these kernels *store* their outputs rather than accumulating
     into them. A candidate that fails to compile for this shape is skipped rather than
