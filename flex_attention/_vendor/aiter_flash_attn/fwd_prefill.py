@@ -13,6 +13,12 @@ from .utils import (
     remap_xcd,
 )
 
+# Kernel knobs for the block-sparse path. The tile sizes are forced to the sparsity
+# granularity, but these are free -- the autotuner is bypassed here because it would
+# pick its own tiles. Exposed as a dict so they can be swept (bench/sweep_sparse_knobs.py)
+# rather than being buried as literals in the launcher.
+SPARSE_FWD_KNOBS = dict(waves_per_eu=2, PRE_LOAD_V=False, num_stages=1, num_warps=4)
+
 FWD_PREFILL_AUTOTUNE_KEYS = [
     "IS_CAUSAL",
     "MAX_SEQLENS_Q",
@@ -1636,14 +1642,7 @@ def attention_forward_prefill_triton_impl(
     )
     if block_sparse is not None:
         launcher = attn_fwd.fn[grid]
-        block_overrides = dict(
-            BLOCK_M=bs_q,
-            BLOCK_N=bs_kv,
-            waves_per_eu=2,
-            PRE_LOAD_V=False,
-            num_stages=1,
-            num_warps=4,
-        )
+        block_overrides = dict(BLOCK_M=bs_q, BLOCK_N=bs_kv, **SPARSE_FWD_KNOBS)
     elif cap_block_m < tuned_block_m:
         if cap_block_m == 0:
             raise ValueError(

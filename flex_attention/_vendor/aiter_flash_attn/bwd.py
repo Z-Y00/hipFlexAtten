@@ -19,6 +19,25 @@ PREPROCESS_AUTOTUNE_KEYS = [
     "IS_VARLEN",
 ]
 
+# See SPARSE_FWD_KNOBS in fwd_prefill.py. BLK_SLICE_FACTOR is inert here: the non-causal
+# fused kernel (the only one block-sparse uses) declares it but never reads it -- the
+# masked-diagonal sub-blocking it controls is causal-kernel-only.
+#
+# matrix_instr_nonkdim=16 is worth 1.1-1.6x on the block-sparse backward depending on
+# shape (measured across seqlen 2048-8192, block 64/128, head_dim 64/128 on MI300X) and
+# was simply never set here -- the tuned dense configs use it, but block-sparse bypasses
+# the autotuner to pin its tiles and so inherited none of that tuning. It is dropped
+# automatically for blocks below _MFMA_ACC_MIN_K at the launch site, mirroring
+# _sanitize_nonkdim.
+#
+# waves_per_eu stays 1 deliberately. 2 is faster at block 64 / long sequences but much
+# slower elsewhere (1.8x at seqlen 8192 block 128, 1.5x at head_dim 128), so it is a
+# genuinely per-shape choice, not a better default.
+SPARSE_BWD_KNOBS = dict(
+    BLK_SLICE_FACTOR=1, waves_per_eu=1, num_stages=1, num_warps=4,
+    matrix_instr_nonkdim=16,
+)
+
 CAUSAL_AUTOTUNE_KEYS = [
     "max_seqlen_q",
     "max_seqlen_k",
@@ -2186,15 +2205,14 @@ def attention_backward_triton_impl(
     if block_sparse:
         bs_q, bs_kv = block_sparse_dkdv.block_size
         bwd_block_overrides = dict(
-            BLOCK_M1=bs_q,
-            BLOCK_N1=bs_kv,
-            BLOCK_M2=bs_q,
-            BLOCK_N2=bs_kv,
-            BLK_SLICE_FACTOR=1,
-            waves_per_eu=1,
-            num_stages=1,
-            num_warps=4,
+            BLOCK_M1=bs_q, BLOCK_N1=bs_kv, BLOCK_M2=bs_q, BLOCK_N2=bs_kv,
+            **SPARSE_BWD_KNOBS,
         )
+        # Same rule as _sanitize_nonkdim: the accumulating tl.dot miscompiles when the
+        # masked sub-block (here just the block size, BLK_SLICE_FACTOR being 1) is
+        # under _MFMA_ACC_MIN_K.
+        if min(bs_q, bs_kv) < _MFMA_ACC_MIN_K:
+            bwd_block_overrides.pop("matrix_instr_nonkdim", None)
     elif cap_block < tuned_block:
         if cap_block == 0:
             raise ValueError(
