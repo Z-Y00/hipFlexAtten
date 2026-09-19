@@ -29,7 +29,7 @@ from flex_attention._vendor.aiter_flash_attn.bwd import attention_backward_trito
 from flex_attention._vendor.aiter_flash_attn.fwd_prefill import (
     attention_forward_prefill_triton_impl,
 )
-from flex_attention.block_sparse import backward_block_sparse
+from flex_attention.block_sparse import backward_block_sparse, causal_block_sparse
 from flex_attention.mods import make_softcap_score_mod
 from flex_attention.split_combine import combine_splits
 
@@ -136,6 +136,19 @@ class _FlashAttnFunc(torch.autograd.Function):
         is_varlen = cu_seqlens_q is not None
         if num_splits > 1 and is_varlen:
             raise NotImplementedError("num_splits > 1 is not supported with varlen yet")
+        if causal and block_sparse is not None:
+            if is_varlen:
+                # Each sequence has its own causal offset and its own block grid, so one
+                # reclassification of the padded grid cannot express them all. Fold
+                # causality into the mask_fn you pass to create_block_sparse_varlen.
+                raise NotImplementedError(
+                    "causal=True with block_sparse_tensors is not supported under varlen; "
+                    "express causality through the block mask instead"
+                )
+            # Intersect causality into the plan: blocks past the diagonal are dropped and
+            # the straddling ones move onto the masked pass, where the kernel applies its
+            # causal mask. Without this the full pass would skip that mask entirely.
+            block_sparse = causal_block_sparse(block_sparse, q.shape[1], k.shape[1])
         layout = "thd" if is_varlen else "bshd"
         window_size_left, window_size_right = _resolve_window(window_size)
         head_dim = q.shape[-1]

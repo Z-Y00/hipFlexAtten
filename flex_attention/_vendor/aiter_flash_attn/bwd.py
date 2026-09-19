@@ -1545,6 +1545,10 @@ def bwd_kernel_fused_noncausal(
     stride_bs_dq_idx_h=0,
     stride_bs_dq_idx_m=0,
     BLOCK_SPARSE: tl.constexpr = False,
+    # Block-sparse only. BlockPlan.with_causal has already dropped every KV block past
+    # the diagonal and forced the straddling ones onto the masked pass, so all that is
+    # left for the kernel is the per-element causal mask on those blocks.
+    IS_CAUSAL: tl.constexpr = False,
 ):
     # program ids
     hkid = tl.program_id(0)
@@ -1687,7 +1691,7 @@ def bwd_kernel_fused_noncausal(
                 num_steps,  # iteration numbers
                 WINDOW_SIZE_LEFT,
                 WINDOW_SIZE_RIGHT,
-                MASK=False,  # causal masking
+                MASK=IS_CAUSAL,  # causal masking
                 USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
                 USE_EXP2=USE_EXP2,
                 DEBUG_TRITON=DEBUG_TRITON,
@@ -1812,7 +1816,7 @@ def bwd_kernel_fused_noncausal(
                 num_steps,
                 WINDOW_SIZE_LEFT,
                 WINDOW_SIZE_RIGHT,
-                MASK=False,
+                MASK=IS_CAUSAL,
                 USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
                 USE_EXP2=USE_EXP2,
                 DEBUG_TRITON=DEBUG_TRITON,
@@ -2078,11 +2082,12 @@ def attention_backward_triton_impl(
     # score_mod/mask_mod are threaded through both fused kernels (causal and non-causal)
     # via _bwd_dkdv_inner / _bwd_dq_inner.
     block_sparse = block_sparse_dkdv is not None
-    if block_sparse and causal:
-        raise NotImplementedError(
-            "block-sparse backward requires the non-causal fused path; express "
-            "causality through the block mask itself."
-        )
+    # Block-sparse always takes the non-causal fused kernel: its block geometry comes
+    # from the index lists, not from the causal block arithmetic the causal kernel is
+    # built around. Causality is still honoured -- BlockPlan.with_causal drops the
+    # blocks past the diagonal and forces the straddling ones onto the masked pass,
+    # and IS_CAUSAL below applies the per-element mask there.
+    use_causal_kernel = causal and not block_sparse
     # Either edge may be unbounded and is handled uniformly (mirroring the forward
     # kernels): WINDOW_SIZE_LEFT < 0 lets keys reach back to 0 / queries have no
     # upper limit, and WINDOW_SIZE_RIGHT < 0 lets keys reach forward to seqlen_k - 1
@@ -2241,7 +2246,7 @@ def attention_backward_triton_impl(
             step = min(META["BLOCK_N1"], META["BLOCK_M2"])
             return (nheads_k, ((seqlen + step - 1) // step), batch)
 
-    if causal:
+    if use_causal_kernel:
 
         if DEBUG_TRITON:
             print(f"bwd_kernel: grid = {grid}")
@@ -2407,5 +2412,6 @@ def attention_backward_triton_impl(
             stride_bs_dq_idx_h=0 if not block_sparse else block_sparse_dq.mask_block_idx.stride(1),
             stride_bs_dq_idx_m=0 if not block_sparse else block_sparse_dq.mask_block_idx.stride(2),
             BLOCK_SPARSE=block_sparse,
+            IS_CAUSAL=causal,
             **bwd_block_overrides,
         )

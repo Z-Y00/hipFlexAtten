@@ -253,3 +253,90 @@ def test_backward_plan_drops_full_fast_path():
     assert dq_plan.full is None and dkdv_plan.full is None
     # every originally-visited (full or masked) block must survive the merge
     assert dq_plan.mask_block_cnt.sum().item() == (bs.full_block_cnt + bs.mask_block_cnt).sum().item()
+
+
+# -- causal composed with a custom sparsity pattern --
+
+
+def _strided_block_mask(batch, nheads, nblk, keep_every, device):
+    qb = torch.arange(nblk, device=device).view(1, 1, nblk, 1)
+    kb = torch.arange(nblk, device=device).view(1, 1, 1, nblk)
+    return (((qb * 5 + kb) % keep_every) == 0).expand(batch, nheads, nblk, nblk)
+
+
+@needs_gpu
+def test_causal_composes_with_block_sparse():
+    """causal=True must intersect into the block plan rather than being rejected.
+
+    The pattern here is one the causal/window planner cannot express on its own, so
+    this genuinely exercises both mechanisms at once.
+    """
+    device = "cuda"
+    batch, seqlen, nheads, head_dim, keep_every = 2, 256, 2, 64, 3
+    q, k, v = _qkv(batch, seqlen, nheads, nheads, head_dim, torch.bfloat16, device)
+    qr, kr, vr = [t.detach().clone().requires_grad_() for t in (q, k, v)]
+    scale = head_dim**-0.5
+    keep_blk = _strided_block_mask(batch, nheads, seqlen // BLOCK, keep_every, device)
+    bs = dense_to_block_sparse(keep_blk, torch.zeros_like(keep_blk), (BLOCK, BLOCK))
+
+    def ref_mask(b, h, qi, ki):
+        blk = (((qi // BLOCK) * 5 + (ki // BLOCK)) % keep_every) == 0
+        return blk & (ki <= qi)
+
+    out = flash_attn_func(q, k, v, softmax_scale=scale, causal=True, block_sparse_tensors=bs)
+    ref = ref_attention(qr, kr, vr, ref_mask, scale)
+    torch.testing.assert_close(out.float(), ref.float(), atol=3e-2, rtol=3e-2)
+
+    do = torch.randn_like(out)
+    out.backward(do)
+    ref.backward(do)
+    for got, want, name in [(q, qr, "dq"), (k, kr, "dk"), (v, vr, "dv")]:
+        torch.testing.assert_close(
+            got.grad.float(), want.grad.float(), atol=1e-1, rtol=1e-1,
+            msg=lambda m, n=name: f"{n}: {m}",
+        )
+
+
+@needs_gpu
+def test_causal_block_sparse_matches_dense_causal_non_square():
+    """An all-blocks plan plus causal=True must reproduce the dense causal kernel.
+
+    seqlen_q != seqlen_k so the bottom-right causal offset is non-zero, which is where
+    an off-by-one in the block reclassification would show up.
+    """
+    device = "cuda"
+    batch, nheads, head_dim, sq, sk = 1, 2, 64, 128, 256
+    mk = lambda n: (  # noqa: E731
+        torch.randn(batch, n, nheads, head_dim, dtype=torch.bfloat16, device=device) * 0.3
+    ).requires_grad_()
+    torch.manual_seed(0)
+    q, k, v = mk(sq), mk(sk), mk(sk)
+    qr, kr, vr = [t.detach().clone().requires_grad_() for t in (q, k, v)]
+    scale = head_dim**-0.5
+    allblk = torch.ones(batch, nheads, sq // BLOCK, sk // BLOCK, dtype=torch.bool, device=device)
+    bs = dense_to_block_sparse(allblk, torch.zeros_like(allblk), (BLOCK, BLOCK))
+
+    out = flash_attn_func(q, k, v, softmax_scale=scale, causal=True, block_sparse_tensors=bs)
+    ref = flash_attn_func(qr, kr, vr, softmax_scale=scale, causal=True)
+    torch.testing.assert_close(out.float(), ref.float(), atol=1e-2, rtol=1e-2)
+    do = torch.randn_like(out)
+    out.backward(do)
+    ref.backward(do)
+    for got, want, name in [(q, qr, "dq"), (k, kr, "dk"), (v, vr, "dv")]:
+        torch.testing.assert_close(
+            got.grad.float(), want.grad.float(), atol=5e-2, rtol=5e-2,
+            msg=lambda m, n=name: f"{n}: {m}",
+        )
+
+
+def test_with_causal_drops_blocks_past_the_diagonal():
+    """Host-side reclassification: full below, masked on, dropped past the diagonal."""
+    full = torch.ones(1, 1, 4, 4, dtype=torch.bool)
+    plan = dense_to_block_sparse(full, torch.zeros_like(full), (64, 64))
+    causal = plan.with_causal(256, 256)
+    below = torch.tril(torch.ones(4, 4, dtype=torch.bool), -1)
+    torch.testing.assert_close(causal.full.to_dense(4)[0, 0], below)
+    torch.testing.assert_close(causal.masked.to_dense(4)[0, 0], torch.eye(4, dtype=torch.bool))
+    assert causal.causal is not None  # the diagonal band is labelled as such
+    # nothing above the diagonal survives
+    assert int(causal.full.count.sum() + causal.masked.count.sum()) == 10

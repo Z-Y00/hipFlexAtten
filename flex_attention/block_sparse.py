@@ -51,6 +51,7 @@ __all__ = [
     "BlockPlan",
     "BlockSparseTensors",
     "backward_block_sparse",
+    "causal_block_sparse",
     "combine_block_sparse",
     "create_block_sparse_from_mask_mod",
     "create_block_sparse_varlen",
@@ -432,6 +433,60 @@ class BlockPlan:
         merged = BlockList.union([self.masked, self.full], num_kv_blocks)
         return BlockPlan(block_size=self.block_size, masked=merged)
 
+    def with_causal(self, seqlen_q: int, seqlen_k: int) -> "BlockPlan":
+        """Intersect a bottom-right-aligned causal constraint into this plan.
+
+        Lets ``causal=True`` compose with a custom sparsity pattern instead of forcing
+        the caller to fold causality into their ``mask_mod`` by hand. Three outcomes per
+        block, against the kernel's own causal predicate ``kv_idx <= q_idx + (seqlen_k -
+        seqlen_q)``:
+
+        * entirely past the diagonal -- dropped, so the kernel never visits it;
+        * straddling the diagonal -- forced into the masked list and labelled CAUSAL,
+          since the kernel applies its causal mask only on the masked pass;
+        * entirely before the diagonal -- left as it was, causal being a no-op there.
+
+        Moving straddling blocks out of the FULL list is what makes this correct: the
+        full pass runs with ``APPLY_MASK=False`` and would skip the causal mask outright.
+
+        The PARTIAL_DENSE/PARTIAL_SPARSE split is not carried across -- intersecting with
+        causal changes how much of each block survives, so the old kept-fraction labels
+        would be stale. Surviving masked blocks are reported as CAUSAL where they meet
+        the diagonal and PARTIAL_SPARSE elsewhere.
+        """
+        q_bs, kv_bs = self.block_size
+        nkv = self.num_kv_blocks
+        nq = self.masked.index.shape[2]
+        device = self.masked.index.device
+        offset = seqlen_k - seqlen_q
+
+        q_blk = torch.arange(nq, device=device).view(nq, 1)
+        kv_blk = torch.arange(nkv, device=device).view(1, nkv)
+        q_first, q_last = q_blk * q_bs, q_blk * q_bs + q_bs - 1
+        kv_first, kv_last = kv_blk * kv_bs, kv_blk * kv_bs + kv_bs - 1
+        fully_visible = kv_last <= q_first + offset
+        fully_hidden = kv_first > q_last + offset
+        straddling = ~fully_visible & ~fully_hidden
+
+        masked_dense = self.masked.to_dense(nkv)
+        full_dense = (
+            self.full.to_dense(nkv) if self.full is not None
+            else torch.zeros_like(masked_dense)
+        )
+        keep_full = full_dense & fully_visible
+        keep_masked = (masked_dense | (full_dense & straddling)) & ~fully_hidden
+
+        flags = {}
+        if keep_full.any():
+            flags[BlockCategory.FULL] = keep_full
+        on_diagonal = keep_masked & straddling
+        off_diagonal = keep_masked & ~straddling
+        if on_diagonal.any():
+            flags[BlockCategory.CAUSAL] = on_diagonal
+        if off_diagonal.any() or not flags:
+            flags[BlockCategory.PARTIAL_SPARSE] = off_diagonal
+        return BlockPlan.from_category_flags(flags, self.block_size)
+
     def transposed(self, num_kv_blocks: int) -> "BlockPlan":
         """Invert the mapping: per-Q-block KV lists -> per-KV-block Q lists.
 
@@ -464,6 +519,24 @@ def _cache_slot(mask_idx: torch.Tensor) -> dict:
         _BWD_CACHE[id(mask_idx)] = slot
         weakref.finalize(mask_idx, _BWD_CACHE.pop, id(mask_idx), None)
     return slot
+
+
+def causal_block_sparse(plan: BlockPlan, seqlen_q: int, seqlen_k: int) -> BlockPlan:
+    """:meth:`BlockPlan.with_causal`, memoized per plan and sequence shape.
+
+    Masks are typically built once and reused every step, so the reclassification (a
+    handful of small kernels plus the device sync that sizes the packed index tensor)
+    should not be paid per call. Same identity-keyed, weakref-finalized cache as
+    :func:`backward_block_sparse`.
+    """
+    slot = _cache_slot(plan.mask_block_idx)
+    key = ("causal", id(plan.full_block_idx) if plan.full_block_idx is not None else None,
+           seqlen_q, seqlen_k)
+    hit = slot.get(key)
+    if hit is None:
+        hit = plan.with_causal(seqlen_q, seqlen_k)
+        slot[key] = hit
+    return hit
 
 
 def backward_block_sparse(plan: BlockPlan, num_kv_blocks: int) -> Tuple[BlockPlan, BlockPlan]:

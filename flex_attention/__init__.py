@@ -5,6 +5,7 @@ from flex_attention.block_sparse import (
     create_block_sparse_varlen,
     dense_to_block_sparse,
 )
+from flex_attention.tuning import TuningResult, tune_block_plan
 from flex_attention.mods import (
     causal_mask_mod,
     identity_score_mod_bwd,
@@ -23,4 +24,6 @@ __all__ = [
     "identity_score_mod_bwd",
     "make_sliding_window_mask_mod",
     "make_softcap_score_mod",
+    "TuningResult",
+    "tune_block_plan",
 ]
