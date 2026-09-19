@@ -9,6 +9,7 @@ from .utils import (
     DEBUG,
     AutotuneMode,
     get_arch,
+    pick_knobs,
     max_block_for_lds,
     remap_xcd,
 )
@@ -33,15 +34,37 @@ PREPROCESS_AUTOTUNE_KEYS = [
 # waves_per_eu stays 1 deliberately. 2 is faster at block 64 / long sequences but much
 # slower elsewhere (1.8x at seqlen 8192 block 128, 1.5x at head_dim 128), so it is a
 # genuinely per-shape choice, not a better default.
-#
-# Unlike the forward (see sparse_fwd_default), there is no free rule to key this on:
-# on gfx950 a block-64 backward wants waves_per_eu=2 at head_dim 64, by 1.18-1.32x, but
-# is 1.41x slower with it at head_dim 128; on gfx942 the same setting only wins at the
-# longest sequence. Capturing that needs per-shape measurement, not a better constant.
 SPARSE_BWD_KNOBS = dict(
     BLK_SLICE_FACTOR=1, waves_per_eu=1, num_stages=1, num_warps=4,
     matrix_instr_nonkdim=16,
 )
+
+
+def sparse_bwd_default(kv_block: int) -> dict:
+    """The knobs used when autotuning is off. Deliberately not keyed on block size.
+
+    Unlike the forward, the backward's best waves_per_eu does not split cleanly: on
+    gfx950 a block-64 backward prefers 2 by 1.18-1.32x at head_dim 64 but is 1.41x
+    *slower* with it at head_dim 128, and on gfx942 the same setting is best only at the
+    longest sequence. There is no free rule that is right everywhere, so the fallback
+    stays at the shape-independent value and per-shape selection is left to pick_knobs.
+    """
+    return SPARSE_BWD_KNOBS
+
+
+def sparse_bwd_candidates(kv_block: int) -> list:
+    """Knob sets to measure when autotuning is on. The default goes first so it wins ties."""
+    default = sparse_bwd_default(kv_block)
+    others = [
+        dict(BLK_SLICE_FACTOR=1, waves_per_eu=w, num_stages=st, num_warps=4,
+             matrix_instr_nonkdim=16)
+        for w, st in ((1, 1), (2, 1), (2, 2), (1, 2))
+    ]
+    return [default] + [c for c in others if c != default]
+
+
+# Keyed on the same shape properties as NONCAUSAL_AUTOTUNE_KEYS, plus the block size.
+_SPARSE_BWD_CHOICE: dict = {}
 
 CAUSAL_AUTOTUNE_KEYS = [
     "max_seqlen_q",
@@ -2222,7 +2245,7 @@ def attention_backward_triton_impl(
         bs_q, bs_kv = block_sparse_dkdv.block_size
         bwd_block_overrides = dict(
             BLOCK_M1=bs_q, BLOCK_N1=bs_kv, BLOCK_M2=bs_q, BLOCK_N2=bs_kv,
-            **SPARSE_BWD_KNOBS,
+            **sparse_bwd_default(bs_kv),
         )
         # Same rule as _sanitize_nonkdim: the accumulating tl.dot miscompiles when the
         # masked sub-block (here just the block size, BLK_SLICE_FACTOR being 1) is
@@ -2363,89 +2386,109 @@ def attention_backward_triton_impl(
             if bwd_block_overrides
             else bwd_kernel_fused_noncausal[grid]
         )
-        noncausal_launcher(
-            q,
-            k,
-            v,
-            sm_scale,
-            do,
-            dq,
-            dk,
-            dv,
-            softmax_lse,
-            delta,
-            stride_qb,
-            stride_qh,
-            stride_qm,
-            stride_qd,
-            stride_kb,
-            stride_kh,
-            stride_kn,
-            stride_kd,
-            stride_vb,
-            stride_vh,
-            stride_vn,
-            stride_vd,
-            stride_dqb,
-            stride_dqh,
-            stride_dqm,
-            stride_dqd,
-            stride_dkb,
-            stride_dkh,
-            stride_dkn,
-            stride_dkd,
-            stride_dvb,
-            stride_dvh,
-            stride_dvn,
-            stride_dvd,
-            stride_lse_b,
-            stride_lse_h,
-            stride_lse_m,
-            stride_delta_b,
-            stride_delta_h,
-            stride_delta_m,
-            stride_dob,
-            stride_doh,
-            stride_dom,
-            stride_dod,
-            nheads_q,
-            nheads_k,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            HEAD_DIM_QK=HEAD_DIM_QK,
-            HEAD_DIM_V=HEAD_DIM_V,
-            ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
-            ACTUAL_HEAD_DIM_V=ACTUAL_HEAD_DIM_V,
-            IS_VARLEN=IS_VARLEN,
-            USE_EXP2=use_exp2,
-            USE_SLIDING_WINDOW=use_sliding_window,
-            WINDOW_SIZE_LEFT=window_size_left,
-            WINDOW_SIZE_RIGHT=window_size_right,
-            DEBUG_TRITON=DEBUG_TRITON,
-            DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
-            NUM_XCD=num_xcd,
-            SCORE_MOD=score_mod,
-            MASK_MOD=mask_mod,
-            SCORE_MOD_BWD=score_mod_bwd,
-            BS_DKDV_CNT=None if not block_sparse else block_sparse_dkdv.mask_block_cnt,
-            BS_DKDV_IDX=None if not block_sparse else block_sparse_dkdv.mask_block_idx,
-            BS_DQ_CNT=None if not block_sparse else block_sparse_dq.mask_block_cnt,
-            BS_DQ_IDX=None if not block_sparse else block_sparse_dq.mask_block_idx,
-            stride_bs_dkdv_cnt_b=0 if not block_sparse else block_sparse_dkdv.mask_block_cnt.stride(0),
-            stride_bs_dkdv_cnt_h=0 if not block_sparse else block_sparse_dkdv.mask_block_cnt.stride(1),
-            stride_bs_dkdv_cnt_m=0 if not block_sparse else block_sparse_dkdv.mask_block_cnt.stride(2),
-            stride_bs_dkdv_idx_b=0 if not block_sparse else block_sparse_dkdv.mask_block_idx.stride(0),
-            stride_bs_dkdv_idx_h=0 if not block_sparse else block_sparse_dkdv.mask_block_idx.stride(1),
-            stride_bs_dkdv_idx_m=0 if not block_sparse else block_sparse_dkdv.mask_block_idx.stride(2),
-            stride_bs_dq_cnt_b=0 if not block_sparse else block_sparse_dq.mask_block_cnt.stride(0),
-            stride_bs_dq_cnt_h=0 if not block_sparse else block_sparse_dq.mask_block_cnt.stride(1),
-            stride_bs_dq_cnt_m=0 if not block_sparse else block_sparse_dq.mask_block_cnt.stride(2),
-            stride_bs_dq_idx_b=0 if not block_sparse else block_sparse_dq.mask_block_idx.stride(0),
-            stride_bs_dq_idx_h=0 if not block_sparse else block_sparse_dq.mask_block_idx.stride(1),
-            stride_bs_dq_idx_m=0 if not block_sparse else block_sparse_dq.mask_block_idx.stride(2),
-            BLOCK_SPARSE=block_sparse,
-            IS_CAUSAL=causal,
-            **bwd_block_overrides,
-        )
+        def _launch_noncausal(_overrides):
+            """The non-causal launch, parameterised by tile/knob overrides, so the
+            block-sparse path can time candidates before committing (see pick_knobs)."""
+            noncausal_launcher(
+                q,
+                k,
+                v,
+                sm_scale,
+                do,
+                dq,
+                dk,
+                dv,
+                softmax_lse,
+                delta,
+                stride_qb,
+                stride_qh,
+                stride_qm,
+                stride_qd,
+                stride_kb,
+                stride_kh,
+                stride_kn,
+                stride_kd,
+                stride_vb,
+                stride_vh,
+                stride_vn,
+                stride_vd,
+                stride_dqb,
+                stride_dqh,
+                stride_dqm,
+                stride_dqd,
+                stride_dkb,
+                stride_dkh,
+                stride_dkn,
+                stride_dkd,
+                stride_dvb,
+                stride_dvh,
+                stride_dvn,
+                stride_dvd,
+                stride_lse_b,
+                stride_lse_h,
+                stride_lse_m,
+                stride_delta_b,
+                stride_delta_h,
+                stride_delta_m,
+                stride_dob,
+                stride_doh,
+                stride_dom,
+                stride_dod,
+                nheads_q,
+                nheads_k,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                HEAD_DIM_QK=HEAD_DIM_QK,
+                HEAD_DIM_V=HEAD_DIM_V,
+                ACTUAL_HEAD_DIM_QK=ACTUAL_HEAD_DIM_QK,
+                ACTUAL_HEAD_DIM_V=ACTUAL_HEAD_DIM_V,
+                IS_VARLEN=IS_VARLEN,
+                USE_EXP2=use_exp2,
+                USE_SLIDING_WINDOW=use_sliding_window,
+                WINDOW_SIZE_LEFT=window_size_left,
+                WINDOW_SIZE_RIGHT=window_size_right,
+                DEBUG_TRITON=DEBUG_TRITON,
+                DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
+                NUM_XCD=num_xcd,
+                SCORE_MOD=score_mod,
+                MASK_MOD=mask_mod,
+                SCORE_MOD_BWD=score_mod_bwd,
+                BS_DKDV_CNT=None if not block_sparse else block_sparse_dkdv.mask_block_cnt,
+                BS_DKDV_IDX=None if not block_sparse else block_sparse_dkdv.mask_block_idx,
+                BS_DQ_CNT=None if not block_sparse else block_sparse_dq.mask_block_cnt,
+                BS_DQ_IDX=None if not block_sparse else block_sparse_dq.mask_block_idx,
+                stride_bs_dkdv_cnt_b=0 if not block_sparse else block_sparse_dkdv.mask_block_cnt.stride(0),
+                stride_bs_dkdv_cnt_h=0 if not block_sparse else block_sparse_dkdv.mask_block_cnt.stride(1),
+                stride_bs_dkdv_cnt_m=0 if not block_sparse else block_sparse_dkdv.mask_block_cnt.stride(2),
+                stride_bs_dkdv_idx_b=0 if not block_sparse else block_sparse_dkdv.mask_block_idx.stride(0),
+                stride_bs_dkdv_idx_h=0 if not block_sparse else block_sparse_dkdv.mask_block_idx.stride(1),
+                stride_bs_dkdv_idx_m=0 if not block_sparse else block_sparse_dkdv.mask_block_idx.stride(2),
+                stride_bs_dq_cnt_b=0 if not block_sparse else block_sparse_dq.mask_block_cnt.stride(0),
+                stride_bs_dq_cnt_h=0 if not block_sparse else block_sparse_dq.mask_block_cnt.stride(1),
+                stride_bs_dq_cnt_m=0 if not block_sparse else block_sparse_dq.mask_block_cnt.stride(2),
+                stride_bs_dq_idx_b=0 if not block_sparse else block_sparse_dq.mask_block_idx.stride(0),
+                stride_bs_dq_idx_h=0 if not block_sparse else block_sparse_dq.mask_block_idx.stride(1),
+                stride_bs_dq_idx_m=0 if not block_sparse else block_sparse_dq.mask_block_idx.stride(2),
+                BLOCK_SPARSE=block_sparse,
+                IS_CAUSAL=causal,
+                **_overrides,
+            )
+
+        if block_sparse and AUTOTUNE != "off":
+            # Choose once per shape, then launch normally. Key mirrors
+            # NONCAUSAL_AUTOTUNE_KEYS, plus the block size the tiles are pinned to.
+            tune_key = (
+                bs_q, bs_kv, max_seqlen_q, max_seqlen_k,
+                ACTUAL_HEAD_DIM_QK, ACTUAL_HEAD_DIM_V, IS_VARLEN, nheads_q, nheads_k,
+            )
+            candidates = [
+                dict(BLOCK_M1=bs_q, BLOCK_N1=bs_kv, BLOCK_M2=bs_q, BLOCK_N2=bs_kv, **knobs)
+                for knobs in sparse_bwd_candidates(bs_kv)
+            ]
+            bwd_block_overrides = pick_knobs(
+                _SPARSE_BWD_CHOICE, tune_key, candidates, _launch_noncausal
+            )
+
+        _launch_noncausal(bwd_block_overrides)

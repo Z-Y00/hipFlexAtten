@@ -29,6 +29,8 @@ __all__ = [
     "AutotuneMode",
     # Runtime info
     "get_arch",
+    "pick_knobs",
+    "time_launch",
 ]
 
 
@@ -153,6 +155,65 @@ def get_arch() -> GpuArch:
         return GpuArch(name=name, family="rdna")
     else:
         return GpuArch(name=name)
+
+
+# -------------------------------
+# Block-sparse knob selection
+# -------------------------------
+# Block-sparse pins the kernel tiles to the sparsity granularity, so it cannot use
+# triton.autotune -- that would pick its own tiles. The remaining knobs (waves_per_eu
+# and friends) are still free, and the best value is strongly per-shape: measured across
+# block size, sequence length, head dim and architecture, waves_per_eu swings results by
+# up to 2x in *either* direction, and the winner at block 64 is the loser at block 128.
+#
+# Wrapping the kernel in a second autotuner does work, but costs 8-19 us on every launch
+# (triton short-circuits to a lean path only when it holds a single config; with several
+# it re-extracts its key and looks up its cache each time). On a 75 us kernel that
+# overhead exceeds the win. So: choose once per shape, cache the winner, and let every
+# later launch go down the normal lean path.
+
+
+def time_launch(launch, warmup: int = 3, reps: int = 7) -> float:
+    """Median wall time of ``launch()`` in milliseconds."""
+    for _ in range(warmup):
+        launch()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(reps):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        launch()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    times.sort()
+    return times[len(times) // 2]
+
+
+def pick_knobs(cache: dict, key, candidates, launch):
+    """Return the fastest candidate for ``key``, measuring once and caching the winner.
+
+    ``launch(candidate)`` must run the kernel; it is called repeatedly during selection,
+    which is safe because these kernels *store* their outputs rather than accumulating
+    into them. A candidate that fails to compile for this shape is skipped rather than
+    raising, so an unusable block size just does not get chosen.
+    """
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    best, best_ms = None, float("inf")
+    for cand in candidates:
+        try:
+            ms = time_launch(lambda c=cand: launch(c))
+        except Exception:  # noqa: BLE001 - an unusable config is simply not selected
+            continue
+        if ms < best_ms:
+            best, best_ms = cand, ms
+    if best is None:
+        best = candidates[0]  # nothing measured; fall back and let the real launch raise
+    cache[key] = best
+    return best
 
 
 @triton.jit

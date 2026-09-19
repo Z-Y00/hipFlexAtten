@@ -9,33 +9,45 @@ from .utils import (
     FWD_CONF_OVERRIDE,
     AutotuneMode,
     get_arch,
+    pick_knobs,
     max_block_for_lds,
     remap_xcd,
 )
 
 # Kernel knobs for the block-sparse path. The tile sizes are forced to the sparsity
-# granularity, but these are free -- the autotuner is bypassed here because it would
-# pick its own tiles. Exposed as a dict so they can be swept (bench/sweep_sparse_knobs.py)
-# rather than being buried as literals in the launcher.
+# granularity, but these are free -- the stock autotuner is bypassed here only because it
+# would pick its own tiles. See pick_knobs() in utils.py for how the winner is chosen.
+#
+# Exposed as a dict so bench/sweep_sparse_knobs.py can sweep them.
 SPARSE_FWD_KNOBS = dict(waves_per_eu=2, PRE_LOAD_V=False, num_stages=1, num_warps=4)
 
 
 def sparse_fwd_default(kv_block: int) -> dict:
-    """Block-sparse forward knobs, keyed on architecture and block size.
+    """The knobs used when autotuning is off, keyed on arch and block size.
 
-    waves_per_eu is strongly per-shape, and on gfx950 the split falls cleanly on block
-    size: measured across sequence length and head dim, a block-64 forward is 1.10x
-    faster at seqlen 4096 and 1.15x at 8192 with waves_per_eu=3, while a block-128
-    forward is 1.19-1.33x *slower* with it. Block size is known for free at launch, so
-    that case needs no measurement.
-
-    Only gfx950/block-64 is special-cased -- the one split measured unambiguously, with
-    no shape where it loses (seqlen 2048 and head_dim 128 come out level). gfx942 shows
-    only ~4% for the same change and is left alone.
+    Measured on gfx950, a block-64 forward prefers waves_per_eu=3 by 1.10-1.15x, while a
+    block-128 forward is 1.19-1.33x *slower* with it -- the split is on block size, which
+    is known for free at launch, so there is no reason to leave it to measurement. Only
+    gfx950/block-64 is special-cased: it is the one case measured unambiguously across
+    sequence length and head dim. Everything else keeps the shape-independent value.
     """
     if get_arch().name == "gfx950" and kv_block <= 64:
         return dict(waves_per_eu=3, PRE_LOAD_V=False, num_stages=1, num_warps=4)
     return SPARSE_FWD_KNOBS
+
+
+def sparse_fwd_candidates(kv_block: int) -> list:
+    """Knob sets to measure when autotuning is on. The default goes first so it wins ties."""
+    default = sparse_fwd_default(kv_block)
+    others = [
+        dict(waves_per_eu=w, PRE_LOAD_V=pv, num_stages=st, num_warps=4)
+        for w, pv, st in ((2, False, 1), (3, False, 1), (3, False, 2), (1, False, 1))
+    ]
+    return [default] + [c for c in others if c != default]
+
+
+# Keyed on the same shape properties as FWD_PREFILL_AUTOTUNE_KEYS, plus the block size.
+_SPARSE_FWD_CHOICE: dict = {}
 
 FWD_PREFILL_AUTOTUNE_KEYS = [
     "IS_CAUSAL",
@@ -1695,74 +1707,95 @@ def attention_forward_prefill_triton_impl(
         launcher = attn_fwd[grid]
         block_overrides = {}
 
-    launcher(
-        q,
-        k,
-        v,
-        lse_target,
-        out_target,
-        stride_qb,
-        stride_qh,
-        stride_qm,
-        stride_qd,
-        stride_kb,
-        stride_kh,
-        stride_kn,
-        stride_kd,
-        stride_vb,
-        stride_vh,
-        stride_vn,
-        stride_vd,
-        stride_ob,
-        stride_oh,
-        stride_om,
-        stride_od,
-        stride_lse_z,
-        stride_lse_h,
-        stride_lse_m,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        HQ=nheads_q,
-        HK=nheads_k,
-        ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
-        ACTUAL_BLOCK_DMODEL_V=head_size_v,
-        MAX_SEQLENS_Q=max_seqlens_q,
-        MAX_SEQLENS_K=max_seqlens_k,
-        SM_SCALE=sm_scale,
-        IS_CAUSAL=causal,
-        USE_SLIDING_WINDOW=use_sliding_window,
-        WINDOW_SIZE_LEFT=window_size_left,
-        WINDOW_SIZE_RIGHT=window_size_right,
-        IS_VARLEN=IS_VARLEN,
-        BLOCK_DMODEL_QK=padded_d_model_qk,
-        BLOCK_DMODEL_V=padded_d_model_v,
-        USE_EXP2=use_exp2,
-        FORCE_MASKING=force_masking,
-        NUM_XCD=num_xcd,
-        HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
-        SCORE_MOD=score_mod,
-        MASK_MOD=mask_mod,
-        SINK=learnable_sink,
-        stride_sink_h=0 if learnable_sink is None else learnable_sink.stride(0),
-        USE_SINK=learnable_sink is not None,
-        BS_MASK_CNT=None if block_sparse is None else block_sparse.mask_block_cnt,
-        BS_MASK_IDX=None if block_sparse is None else block_sparse.mask_block_idx,
-        BS_FULL_CNT=None if block_sparse is None else block_sparse.full_block_cnt,
-        BS_FULL_IDX=None if block_sparse is None else block_sparse.full_block_idx,
-        stride_bs_cnt_b=0 if block_sparse is None else block_sparse.mask_block_cnt.stride(0),
-        stride_bs_cnt_h=0 if block_sparse is None else block_sparse.mask_block_cnt.stride(1),
-        stride_bs_cnt_m=0 if block_sparse is None else block_sparse.mask_block_cnt.stride(2),
-        stride_bs_idx_b=0 if block_sparse is None else block_sparse.mask_block_idx.stride(0),
-        stride_bs_idx_h=0 if block_sparse is None else block_sparse.mask_block_idx.stride(1),
-        stride_bs_idx_m=0 if block_sparse is None else block_sparse.mask_block_idx.stride(2),
-        stride_bs_fidx_b=0 if (block_sparse is None or block_sparse.full_block_idx is None) else block_sparse.full_block_idx.stride(0),
-        stride_bs_fidx_h=0 if (block_sparse is None or block_sparse.full_block_idx is None) else block_sparse.full_block_idx.stride(1),
-        stride_bs_fidx_m=0 if (block_sparse is None or block_sparse.full_block_idx is None) else block_sparse.full_block_idx.stride(2),
-        BLOCK_SPARSE=block_sparse is not None,
-        BS_HAS_FULL=block_sparse is not None and block_sparse.full_block_cnt is not None,
-        BS_ALIGNED=bs_aligned,
-        NUM_SPLITS=num_splits,
-        stride_o_split=stride_o_split,
-        stride_lse_split=stride_lse_split,
-        **block_overrides,
-    )
+    def _launch(_overrides):
+        """The kernel launch, parameterised by the tile/knob overrides.
+
+        Factored out so the block-sparse path can time candidate knob sets before
+        committing to one -- see pick_knobs() in utils.py.
+        """
+        launcher(
+            q,
+            k,
+            v,
+            lse_target,
+            out_target,
+            stride_qb,
+            stride_qh,
+            stride_qm,
+            stride_qd,
+            stride_kb,
+            stride_kh,
+            stride_kn,
+            stride_kd,
+            stride_vb,
+            stride_vh,
+            stride_vn,
+            stride_vd,
+            stride_ob,
+            stride_oh,
+            stride_om,
+            stride_od,
+            stride_lse_z,
+            stride_lse_h,
+            stride_lse_m,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            HQ=nheads_q,
+            HK=nheads_k,
+            ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
+            ACTUAL_BLOCK_DMODEL_V=head_size_v,
+            MAX_SEQLENS_Q=max_seqlens_q,
+            MAX_SEQLENS_K=max_seqlens_k,
+            SM_SCALE=sm_scale,
+            IS_CAUSAL=causal,
+            USE_SLIDING_WINDOW=use_sliding_window,
+            WINDOW_SIZE_LEFT=window_size_left,
+            WINDOW_SIZE_RIGHT=window_size_right,
+            IS_VARLEN=IS_VARLEN,
+            BLOCK_DMODEL_QK=padded_d_model_qk,
+            BLOCK_DMODEL_V=padded_d_model_v,
+            USE_EXP2=use_exp2,
+            FORCE_MASKING=force_masking,
+            NUM_XCD=num_xcd,
+            HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
+            SCORE_MOD=score_mod,
+            MASK_MOD=mask_mod,
+            SINK=learnable_sink,
+            stride_sink_h=0 if learnable_sink is None else learnable_sink.stride(0),
+            USE_SINK=learnable_sink is not None,
+            BS_MASK_CNT=None if block_sparse is None else block_sparse.mask_block_cnt,
+            BS_MASK_IDX=None if block_sparse is None else block_sparse.mask_block_idx,
+            BS_FULL_CNT=None if block_sparse is None else block_sparse.full_block_cnt,
+            BS_FULL_IDX=None if block_sparse is None else block_sparse.full_block_idx,
+            stride_bs_cnt_b=0 if block_sparse is None else block_sparse.mask_block_cnt.stride(0),
+            stride_bs_cnt_h=0 if block_sparse is None else block_sparse.mask_block_cnt.stride(1),
+            stride_bs_cnt_m=0 if block_sparse is None else block_sparse.mask_block_cnt.stride(2),
+            stride_bs_idx_b=0 if block_sparse is None else block_sparse.mask_block_idx.stride(0),
+            stride_bs_idx_h=0 if block_sparse is None else block_sparse.mask_block_idx.stride(1),
+            stride_bs_idx_m=0 if block_sparse is None else block_sparse.mask_block_idx.stride(2),
+            stride_bs_fidx_b=0 if (block_sparse is None or block_sparse.full_block_idx is None) else block_sparse.full_block_idx.stride(0),
+            stride_bs_fidx_h=0 if (block_sparse is None or block_sparse.full_block_idx is None) else block_sparse.full_block_idx.stride(1),
+            stride_bs_fidx_m=0 if (block_sparse is None or block_sparse.full_block_idx is None) else block_sparse.full_block_idx.stride(2),
+            BLOCK_SPARSE=block_sparse is not None,
+            BS_HAS_FULL=block_sparse is not None and block_sparse.full_block_cnt is not None,
+            BS_ALIGNED=bs_aligned,
+            NUM_SPLITS=num_splits,
+            stride_o_split=stride_o_split,
+            stride_lse_split=stride_lse_split,
+            **_overrides,
+        )
+
+    if block_sparse is not None and AUTOTUNE != "off":
+        # Choose once per shape, then launch normally. The key mirrors
+        # FWD_PREFILL_AUTOTUNE_KEYS, plus the block size the tiles are pinned to.
+        tune_key = (
+            bs_q, bs_kv, causal, max_seqlens_q, max_seqlens_k,
+            head_size_qk, head_size_v, IS_VARLEN, nheads_q, nheads_k,
+        )
+        candidates = [
+            dict(BLOCK_M=bs_q, BLOCK_N=bs_kv, **knobs)
+            for knobs in sparse_fwd_candidates(bs_kv)
+        ]
+        block_overrides = pick_knobs(_SPARSE_FWD_CHOICE, tune_key, candidates, _launch)
+
+    _launch(block_overrides)
