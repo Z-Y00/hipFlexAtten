@@ -95,10 +95,14 @@ class BlockList:
     ``count``: int32 ``[B, H, num_q_blocks]`` -- how many KV blocks this row has.
     ``index``: int32 ``[B, H, num_q_blocks, max_count]`` -- their indices, packed left;
     entries at or past ``count`` are ignored (typically zero, but not meaningful).
+    ``num_cols``: the width of the grid this was built from, i.e. one past the largest
+    index any entry may hold. Kept so callers can bound-check the list against a
+    sequence length without a device sync (see :meth:`BlockPlan.blocks_fit_within`).
     """
 
     count: torch.Tensor
     index: torch.Tensor
+    num_cols: int
 
     @classmethod
     def from_flags(cls, flags: torch.Tensor) -> "BlockList":
@@ -114,7 +118,7 @@ class BlockList:
             dim=-1,
             stable=True,
         )
-        return cls(counts, order[..., :max_count].to(torch.int32).contiguous())
+        return cls(counts, order[..., :max_count].to(torch.int32).contiguous(), num_cols)
 
     def to_dense(self, num_cols: int) -> torch.Tensor:
         """Inverse of :meth:`from_flags`: expand back to a ``[..., num_cols]`` bool grid."""
@@ -237,6 +241,23 @@ class BlockPlan:
         return self.masked.index
 
     # -- introspection --
+
+    @property
+    def num_kv_blocks(self) -> int:
+        """Width of the block grid: one past the largest KV block index in any list."""
+        return self.masked.num_cols
+
+    def blocks_fit_within(self, seqlen_k: int) -> bool:
+        """True when every KV block this plan can name lies wholly inside ``seqlen_k``.
+
+        When this holds, the kernel knows a priori that no block it visits straddles the
+        end of the sequence, so it can drop the per-block bounds masking it would
+        otherwise need (loads and the -inf fill) -- a sparse block list, unlike a
+        contiguous range, has no other way to identify a "last, partially-filled block".
+        Checked against the grid width rather than the actual indices so it costs no
+        device sync.
+        """
+        return self.num_kv_blocks * self.block_size[1] <= seqlen_k
 
     def category(self, category: BlockCategory) -> Optional[BlockList]:
         """The BlockList for one category, or None if that category has no members

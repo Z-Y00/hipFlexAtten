@@ -314,6 +314,7 @@ def _attn_fwd_inner(
     MASK_MOD: tl.constexpr = None,
     SPARSE_IDX=None,
     BLOCK_SPARSE: tl.constexpr = False,
+    BS_ALIGNED: tl.constexpr = False,
 ):
     """
     Unified attention forward inner loop.
@@ -321,7 +322,16 @@ def _attn_fwd_inner(
     APPLY_MASK controls whether causal/window masking is applied:
     - False: Fast path for full blocks (no masking overhead)
     - True: Masked path with causal/window masking support
+
+    BS_ALIGNED (block-sparse only) asserts every listed KV block lies wholly inside
+    seqlen_k, so no block can straddle the end of the sequence and the per-block bounds
+    masking is provably redundant. It does NOT relax mask_mod or causal/window masking,
+    which are applied independently of the bounds checks below.
     """
+    # A contiguous range identifies its last, partially-filled block by offset; a block
+    # list cannot, so absent the alignment guarantee every sparse block has to be
+    # bounded against seqlen_k. When it holds, all of that work drops out.
+    SKIP_SEQ_BOUNDS: tl.constexpr = BLOCK_SPARSE and BS_ALIGNED
     if USE_EXP2:
         RCP_LN2: tl.constexpr = 1.4426950408889634
 
@@ -347,8 +357,10 @@ def _attn_fwd_inner(
 
         kv_offs_n = start_n + tl.arange(0, BLOCK_N)
 
-        # Load K - different masking for APPLY_MASK vs non-masked
-        if APPLY_MASK:
+        # Load K - different masking for APPLY_MASK vs non-masked. An aligned
+        # block-sparse list needs no seqlen bound, so it takes the unmasked path even
+        # when APPLY_MASK is set for mask_mod's sake.
+        if APPLY_MASK and not SKIP_SEQ_BOUNDS:
             # For masked blocks, check seqlen bounds
             k_mask = kv_offs_n[None, :] < seqlen_k
             v_mask = kv_offs_n[:, None] < seqlen_k
@@ -378,10 +390,14 @@ def _attn_fwd_inner(
 
         # Apply extra token masking for partial blocks (only when APPLY_MASK=True).
         # -inf seeded into the accumulator survives the dot below (-inf + x = -inf).
-        if BLOCK_SPARSE:
+        if BLOCK_SPARSE and not SKIP_SEQ_BOUNDS:
             # A sparse block list has no notion of "last block", so bound every block.
             qk = tl.where(kv_offs_n[None, :] < seqlen_k, qk, float("-inf"))
-        elif APPLY_MASK and ((n_extra_tokens != 0) and (start_n + BLOCK_N == block_max)):
+        elif (
+            (not BLOCK_SPARSE)
+            and APPLY_MASK
+            and ((n_extra_tokens != 0) and (start_n + BLOCK_N == block_max))
+        ):
             boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
             size_n = start_n + offs_n[None, :]
             mask = size_n < boundary_m[:, None]
@@ -508,7 +524,7 @@ def _attn_fwd_inner(
 
         # Load V if not preloaded
         if not PRE_LOAD_V:
-            if APPLY_MASK:
+            if APPLY_MASK and not SKIP_SEQ_BOUNDS:
                 v_mask = kv_offs_n[:, None] < seqlen_k
                 if PADDED_HEAD_V:
                     v_mask = v_mask & (offs_d_v[None, :] < ACTUAL_BLOCK_DMODEL_V)
@@ -892,6 +908,7 @@ def attn_fwd(
     stride_bs_fidx_m=0,
     BLOCK_SPARSE: tl.constexpr = False,
     BS_HAS_FULL: tl.constexpr = False,
+    BS_ALIGNED: tl.constexpr = False,
     NUM_SPLITS: tl.constexpr = 1,
     stride_o_split=0,
     stride_lse_split=0,
@@ -1133,6 +1150,7 @@ def attn_fwd(
                 MASK_MOD=None,
                 SPARSE_IDX=bs_full_idx_ptr,
                 BLOCK_SPARSE=True,
+                BS_ALIGNED=BS_ALIGNED,
             )
         acc, l_i, m_i = _attn_fwd_inner(
             acc, l_i, m_i, q, k_ptrs, v_ptrs,
@@ -1162,6 +1180,7 @@ def attn_fwd(
             MASK_MOD=MASK_MOD,
             SPARSE_IDX=bs_mask_idx_ptr,
             BLOCK_SPARSE=True,
+            BS_ALIGNED=BS_ALIGNED,
         )
     else:
         if n_front_masked_blocks > 0 and USE_SLIDING_WINDOW:
@@ -1689,6 +1708,7 @@ def attention_forward_prefill_triton_impl(
     # head dims never take this path, so the tuned fast path is untouched.
     # Block-sparse requires the kernel tile to match the sparsity granularity exactly,
     # so the autotuner is bypassed and the block sizes are pinned to block_size.
+    bs_aligned = False
     if block_sparse is not None:
         bs_q, bs_kv = block_sparse.block_size
         lds_cap = max_block_for_lds(padded_d_model_qk, q.element_size())
@@ -1697,6 +1717,13 @@ def attention_forward_prefill_triton_impl(
                 f"block_sparse q block {bs_q} exceeds the LDS budget for head_dim "
                 f"{head_size_qk} on this GPU (max {lds_cap})"
             )
+        # Every KV block is a whole BLOCK_N tile inside the sequence, so no block the
+        # kernel visits can straddle its end and the per-block bounds masking is
+        # redundant. Left False under varlen: each sequence ends at its own offset, and
+        # the block grid is padded to the longest, so short sequences do have partial
+        # trailing blocks. Deciding this from the grid width costs no device sync.
+        if not IS_VARLEN:
+            bs_aligned = block_sparse.blocks_fit_within(max_seqlens_k)
 
     cap_block_m = max_block_for_lds(padded_d_model_qk, q.element_size())
     tuned_block_m = max(
@@ -1796,6 +1823,7 @@ def attention_forward_prefill_triton_impl(
         stride_bs_fidx_m=0 if (block_sparse is None or block_sparse.full_block_idx is None) else block_sparse.full_block_idx.stride(2),
         BLOCK_SPARSE=block_sparse is not None,
         BS_HAS_FULL=block_sparse is not None and block_sparse.full_block_cnt is not None,
+        BS_ALIGNED=bs_aligned,
         NUM_SPLITS=num_splits,
         stride_o_split=stride_o_split,
         stride_lse_split=stride_lse_split,
