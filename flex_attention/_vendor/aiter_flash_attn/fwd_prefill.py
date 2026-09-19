@@ -25,6 +25,16 @@ FWD_PREFILL_AUTOTUNE_KEYS = [
 ]
 
 
+# See the note on _bwd_cfg in bwd.py: tuned tables are kept as one-line rows.
+def _fwd_cfg(m, n, waves, preload_v, *, stages, warps):
+    """Forward-prefill config. Columns: BLOCK_M, BLOCK_N, waves_per_eu, PRE_LOAD_V."""
+    return triton.Config(
+        {"BLOCK_M": m, "BLOCK_N": n, "waves_per_eu": waves, "PRE_LOAD_V": preload_v},
+        num_stages=stages,
+        num_warps=warps,
+    )
+
+
 def get_fwd_prefill_configs(mode: AutotuneMode):
     # NOTE: Tests expect specific BLOCK_N sizes for attention score renormalization:
     #   - CDNA: BLOCK_N=64
@@ -37,32 +47,14 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
         arch = get_arch()
         if arch.name == "gfx950" or arch.name == "gfx942":
             return [
-                triton.Config(
-                    {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": 64,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
+                _fwd_cfg(128, 64, 2, False, stages=1, warps=4),
             ]
         elif arch.is_rdna:
             # gfx1151 (Strix Halo / RDNA3.5): tuned for the Qwen3-Omni
             # ViT prefill shape (B=1, S=3200, H=16, head_dim=72, fp16).
             if arch.name == "gfx1151":
                 return [
-                    triton.Config(
-                        {
-                            "BLOCK_M": 128,
-                            "BLOCK_N": 64,
-                            "PRE_LOAD_V": False,
-                            "waves_per_eu": 2,
-                        },
-                        num_stages=1,
-                        num_warps=8,
-                    ),
+                    _fwd_cfg(128, 64, 2, False, stages=1, warps=8),
                 ]
             BLOCK_N = 64 if arch.name == "gfx1100" else 32
             return [
@@ -79,16 +71,7 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
             ]
         else:
             return [
-                triton.Config(
-                    {
-                        "BLOCK_M": 64,
-                        "BLOCK_N": 64,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                )
+                _fwd_cfg(64, 64, 2, False, stages=1, warps=4)
             ]
 
     elif mode == "on":
@@ -97,89 +80,26 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
         arch = get_arch()
         if arch.name == "gfx950":
             return [
-                triton.Config(
-                    {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": 64,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
-                triton.Config(
-                    {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": 64,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=2,
-                ),
-                triton.Config(
-                    {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": 64,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=2,
-                    num_warps=4,
-                ),
-                triton.Config(
-                    {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": 128,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=2,
-                    num_warps=4,
-                ),
+                _fwd_cfg(128, 64, 2, False, stages=1, warps=4),
+                _fwd_cfg(128, 64, 2, False, stages=1, warps=2),
+                _fwd_cfg(128, 64, 2, False, stages=2, warps=4),
+                _fwd_cfg(128, 128, 2, False, stages=2, warps=4),
             ]
         elif arch.name == "gfx942":
             if arch.cu_count < 304:
                 return [
-                    triton.Config(
-                        {
-                            "BLOCK_M": 128,
-                            "BLOCK_N": 64,
-                            "waves_per_eu": 2,
-                            "PRE_LOAD_V": False,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
+                    _fwd_cfg(128, 64, 2, False, stages=1, warps=4),
                 ]
             else:
                 return [
-                    triton.Config(
-                        {
-                            "BLOCK_M": 128,
-                            "BLOCK_N": 64,
-                            "waves_per_eu": 2,
-                            "PRE_LOAD_V": False,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    )
+                    _fwd_cfg(128, 64, 2, False, stages=1, warps=4)
                 ]
         elif arch.is_rdna:
             # gfx1151 (Strix Halo / RDNA3.5): tuned for the Qwen3-Omni
             # ViT prefill shape (B=1, S=3200, H=16, head_dim=72, fp16).
             if arch.name == "gfx1151":
                 return [
-                    triton.Config(
-                        {
-                            "BLOCK_M": 128,
-                            "BLOCK_N": 64,
-                            "PRE_LOAD_V": False,
-                            "waves_per_eu": 2,
-                        },
-                        num_stages=1,
-                        num_warps=8,
-                    ),
+                    _fwd_cfg(128, 64, 2, False, stages=1, warps=8),
                 ]
             BLOCK_N = 64 if arch.name == "gfx1100" else 32
             return [
@@ -196,16 +116,7 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
             ]
         else:
             return [
-                triton.Config(
-                    {
-                        "BLOCK_M": 64,
-                        "BLOCK_N": 64,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                )
+                _fwd_cfg(64, 64, 2, False, stages=1, warps=4)
             ]
 
     else:  # sweep
@@ -1476,12 +1387,8 @@ def attention_forward_prefill_triton_impl(
         _total_seqlen_v, nheads_v, head_size_v = v.shape
 
         # assert shapes
-        assert (
-            cu_seqlens_q is not None
-        ), "cu_seqlens_q must be provided for varlen layout"
-        assert (
-            cu_seqlens_k is not None
-        ), "cu_seqlens_k must be provided for varlen layout"
+        assert cu_seqlens_q is not None, 'cu_seqlens_q must be provided for varlen layout'
+        assert cu_seqlens_k is not None, 'cu_seqlens_k must be provided for varlen layout'
         assert (
             max_seqlens_q is not None and max_seqlens_q > 0
         ), "max_seqlens_q must be provided and positive for varlen layout"
@@ -1645,9 +1552,7 @@ def attention_forward_prefill_triton_impl(
         stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
 
     # check output dtype matches input dtype
-    assert (
-        o.dtype == q.dtype
-    ), f"Output dtype {o.dtype} must match input dtype {q.dtype}"
+    assert o.dtype == q.dtype, f'Output dtype {o.dtype} must match input dtype {q.dtype}'
 
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1

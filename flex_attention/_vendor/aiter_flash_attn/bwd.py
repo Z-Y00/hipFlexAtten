@@ -40,6 +40,32 @@ NONCAUSAL_AUTOTUNE_KEYS = [
 ]
 
 
+# Autotune configs are written as compact positional rows rather than multi-line dict
+# literals: the tables carry a few hundred tuned entries, and one line each keeps them
+# readable as a table. Trailing arguments are optional, and an omitted one leaves its
+# key out of the config entirely (it is not the same as passing a default).
+def _bwd_cfg(m1, n1, m2, n2, slice_factor, waves=None, nonkdim=None, *, stages, warps):
+    """dK/dV + dQ config. Columns: BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2,
+    BLK_SLICE_FACTOR, [waves_per_eu], [matrix_instr_nonkdim]."""
+    kw = {
+        "BLOCK_M1": m1, "BLOCK_N1": n1, "BLOCK_M2": m2, "BLOCK_N2": n2,
+        "BLK_SLICE_FACTOR": slice_factor,
+    }
+    if waves is not None:
+        kw["waves_per_eu"] = waves
+    if nonkdim is not None:
+        kw["matrix_instr_nonkdim"] = nonkdim
+    return triton.Config(kw, num_stages=stages, num_warps=warps)
+
+
+def _pre_cfg(pre_block, waves=None, *, stages, warps):
+    """Preprocess-kernel config. Columns: PRE_BLOCK, [waves_per_eu]."""
+    kw = {"PRE_BLOCK": pre_block}
+    if waves is not None:
+        kw["waves_per_eu"] = waves
+    return triton.Config(kw, num_stages=stages, num_warps=warps)
+
+
 def get_bwd_configs(mode: AutotuneMode):
 
     if mode == "off":
@@ -47,173 +73,53 @@ def get_bwd_configs(mode: AutotuneMode):
         if arch.name == "gfx942":
             if arch.cu_count < 304:
                 preprocess_configs = [
-                    triton.Config(
-                        {"PRE_BLOCK": 64, "waves_per_eu": 1}, num_stages=1, num_warps=8
-                    ),
+                    _pre_cfg(64, 1, stages=1, warps=8),
                 ]
                 noncausal_configs = [
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 32,
-                            "BLOCK_N1": 128,
-                            "BLOCK_M2": 128,
-                            "BLOCK_N2": 64,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 1,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
+                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
                 ]
                 causal_configs = [
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 32,
-                            "BLOCK_N1": 128,
-                            "BLOCK_M2": 128,
-                            "BLOCK_N2": 64,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 1,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
+                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
                 ]
             else:
                 preprocess_configs = [
-                    triton.Config(
-                        {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
-                    ),
+                    _pre_cfg(64, 2, stages=2, warps=8),
                 ]
                 noncausal_configs = [
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 32,
-                            "BLOCK_N1": 128,
-                            "BLOCK_M2": 128,
-                            "BLOCK_N2": 64,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 1,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
+                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
                 ]
                 causal_configs = [
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 32,
-                            "BLOCK_N1": 128,
-                            "BLOCK_M2": 128,
-                            "BLOCK_N2": 64,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 1,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
+                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
                 ]
         elif arch.name == "gfx950":
             preprocess_configs = [
-                triton.Config(
-                    {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
-                ),
+                _pre_cfg(64, 2, stages=2, warps=8),
             ]
             noncausal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 64,
-                        "BLOCK_N1": 128,
-                        "BLOCK_M2": 128,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
+                _bwd_cfg(64, 128, 128, 64, 2, 1, stages=1, warps=4),
             ]
             causal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 128,
-                        "BLOCK_M2": 128,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
+                _bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4),
             ]
         elif arch.is_rdna:
             preprocess_configs = [
-                triton.Config({"PRE_BLOCK": 32}, num_stages=1, num_warps=4),
+                _pre_cfg(32, stages=1, warps=4),
             ]
             noncausal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 32,
-                        "BLOCK_M2": 32,
-                        "BLOCK_N2": 32,
-                        "BLK_SLICE_FACTOR": 2,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
+                _bwd_cfg(32, 32, 32, 32, 2, stages=1, warps=4),
             ]
             causal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 32,
-                        "BLOCK_M2": 32,
-                        "BLOCK_N2": 32,
-                        "BLK_SLICE_FACTOR": 2,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
+                _bwd_cfg(32, 32, 32, 32, 2, stages=1, warps=4),
             ]
         else:
             preprocess_configs = [
-                triton.Config(
-                    {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
-                ),
+                _pre_cfg(64, 2, stages=2, warps=8),
             ]
             noncausal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 128,
-                        "BLOCK_M2": 128,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
+                _bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4),
             ]
             causal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 128,
-                        "BLOCK_M2": 128,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
+                _bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4),
             ]
         return (preprocess_configs, causal_configs, noncausal_configs)
 
@@ -222,427 +128,80 @@ def get_bwd_configs(mode: AutotuneMode):
         if arch.name == "gfx942":
             if arch.cu_count < 304:
                 preprocess_configs = [
-                    triton.Config(
-                        {"PRE_BLOCK": 64, "waves_per_eu": 1}, num_stages=1, num_warps=8
-                    ),
-                    triton.Config(
-                        {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
-                    ),
-                    triton.Config(
-                        {"PRE_BLOCK": 128, "waves_per_eu": 2}, num_stages=1, num_warps=4
-                    ),
+                    _pre_cfg(64, 1, stages=1, warps=8),
+                    _pre_cfg(64, 2, stages=2, warps=8),
+                    _pre_cfg(128, 2, stages=1, warps=4),
                 ]
                 noncausal_configs = [
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 32,
-                            "BLOCK_N1": 128,
-                            "BLOCK_M2": 128,
-                            "BLOCK_N2": 64,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 1,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 64,
-                            "BLOCK_N1": 128,
-                            "BLOCK_M2": 128,
-                            "BLOCK_N2": 64,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 1,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 32,
-                            "BLOCK_N1": 128,
-                            "BLOCK_M2": 128,
-                            "BLOCK_N2": 32,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 2,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=8,
-                    ),
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 32,
-                            "BLOCK_N1": 128,
-                            "BLOCK_M2": 128,
-                            "BLOCK_N2": 32,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 1,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=8,
-                    ),
+                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
+                    _bwd_cfg(64, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
+                    _bwd_cfg(32, 128, 128, 32, 2, 2, 16, stages=1, warps=8),
+                    _bwd_cfg(32, 128, 128, 32, 2, 1, 16, stages=1, warps=8),
                 ]
                 causal_configs = [
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 32,
-                            "BLOCK_N1": 128,
-                            "BLOCK_M2": 128,
-                            "BLOCK_N2": 64,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 1,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 64,
-                            "BLOCK_N1": 64,
-                            "BLOCK_M2": 64,
-                            "BLOCK_N2": 64,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 1,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 32,
-                            "BLOCK_N1": 64,
-                            "BLOCK_M2": 64,
-                            "BLOCK_N2": 64,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 1,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
+                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
+                    _bwd_cfg(64, 64, 64, 64, 2, 1, 16, stages=1, warps=4),
+                    _bwd_cfg(32, 64, 64, 64, 2, 1, 16, stages=1, warps=4),
                 ]
             else:
                 preprocess_configs = [
-                    triton.Config(
-                        {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
-                    ),
-                    triton.Config(
-                        {"PRE_BLOCK": 64, "waves_per_eu": 1}, num_stages=1, num_warps=4
-                    ),
+                    _pre_cfg(64, 2, stages=2, warps=8),
+                    _pre_cfg(64, 1, stages=1, warps=4),
                 ]
                 noncausal_configs = [
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 32,
-                            "BLOCK_N1": 128,
-                            "BLOCK_M2": 128,
-                            "BLOCK_N2": 64,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 1,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 64,
-                            "BLOCK_N1": 64,
-                            "BLOCK_M2": 64,
-                            "BLOCK_N2": 64,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 1,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 32,
-                            "BLOCK_N1": 64,
-                            "BLOCK_M2": 64,
-                            "BLOCK_N2": 64,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 2,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
+                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
+                    _bwd_cfg(64, 64, 64, 64, 2, 1, 16, stages=1, warps=4),
+                    _bwd_cfg(32, 64, 64, 64, 2, 2, 16, stages=1, warps=4),
                 ]
                 causal_configs = [
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 32,
-                            "BLOCK_N1": 128,
-                            "BLOCK_M2": 128,
-                            "BLOCK_N2": 64,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 1,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
-                    triton.Config(
-                        {
-                            "BLOCK_M1": 32,
-                            "BLOCK_N1": 64,
-                            "BLOCK_M2": 64,
-                            "BLOCK_N2": 64,
-                            "BLK_SLICE_FACTOR": 2,
-                            "waves_per_eu": 1,
-                            "matrix_instr_nonkdim": 16,
-                        },
-                        num_stages=1,
-                        num_warps=4,
-                    ),
+                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
+                    _bwd_cfg(32, 64, 64, 64, 2, 1, 16, stages=1, warps=4),
                 ]
         elif arch.name == "gfx950":
             preprocess_configs = [
-                triton.Config(
-                    {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
-                ),
-                triton.Config(
-                    {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=1, num_warps=8
-                ),
-                triton.Config(
-                    {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=4
-                ),
+                _pre_cfg(64, 2, stages=2, warps=8),
+                _pre_cfg(64, 2, stages=1, warps=8),
+                _pre_cfg(64, 2, stages=2, warps=4),
             ]
             noncausal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 64,
-                        "BLOCK_N1": 128,
-                        "BLOCK_M2": 128,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
-                triton.Config(
-                    {
-                        "BLOCK_M1": 64,
-                        "BLOCK_N1": 128,
-                        "BLOCK_M2": 128,
-                        "BLOCK_N2": 128,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
-                triton.Config(
-                    {
-                        "BLOCK_M1": 64,
-                        "BLOCK_N1": 64,
-                        "BLOCK_M2": 64,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
-                triton.Config(
-                    {
-                        "BLOCK_M1": 16,
-                        "BLOCK_N1": 64,
-                        "BLOCK_M2": 64,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 2,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 256,
-                        "BLOCK_M2": 256,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
-                    },
-                    num_stages=2,
-                    num_warps=8,
-                ),
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 256,
-                        "BLOCK_M2": 256,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 2,
-                    },
-                    num_stages=2,
-                    num_warps=8,
-                ),
+                _bwd_cfg(64, 128, 128, 64, 2, 1, stages=1, warps=4),
+                _bwd_cfg(64, 128, 128, 128, 2, 1, stages=1, warps=4),
+                _bwd_cfg(64, 64, 64, 64, 2, 1, stages=1, warps=4),
+                _bwd_cfg(16, 64, 64, 64, 2, 2, stages=1, warps=4),
+                _bwd_cfg(32, 256, 256, 64, 2, 1, stages=2, warps=8),
+                _bwd_cfg(32, 256, 256, 64, 2, 2, stages=2, warps=8),
                 # mid-tile, 2-stage variant
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 128,
-                        "BLOCK_M2": 128,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 2,
-                    },
-                    num_stages=2,
-                    num_warps=4,
-                ),
+                _bwd_cfg(32, 128, 128, 64, 2, 2, stages=2, warps=4),
             ]
             causal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 128,
-                        "BLOCK_M2": 128,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
-                triton.Config(
-                    {
-                        "BLOCK_M1": 64,
-                        "BLOCK_N1": 64,
-                        "BLOCK_M2": 64,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 128,
-                        "BLOCK_M2": 128,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
-                    },
-                    num_stages=2,
-                    num_warps=4,
-                ),
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 128,
-                        "BLOCK_M2": 128,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 2,
-                    },
-                    num_stages=2,
-                    num_warps=4,
-                ),
+                _bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4),
+                _bwd_cfg(64, 64, 64, 64, 2, 1, stages=1, warps=4),
+                _bwd_cfg(32, 128, 128, 64, 2, 1, stages=2, warps=4),
+                _bwd_cfg(32, 128, 128, 64, 2, 2, stages=2, warps=4),
                 # larger-tile variant (helps long-seq throughput; noncausal-proven)
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 256,
-                        "BLOCK_M2": 256,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 2,
-                    },
-                    num_stages=2,
-                    num_warps=8,
-                ),
+                _bwd_cfg(32, 256, 256, 64, 2, 2, stages=2, warps=8),
                 # small-tile variant (helps short seqlen / wide-window cases)
-                triton.Config(
-                    {
-                        "BLOCK_M1": 16,
-                        "BLOCK_N1": 64,
-                        "BLOCK_M2": 64,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 2,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
+                _bwd_cfg(16, 64, 64, 64, 2, 2, stages=1, warps=4),
             ]
         elif arch.is_rdna:
             preprocess_configs = [
-                triton.Config({"PRE_BLOCK": 32}, num_stages=1, num_warps=4),
+                _pre_cfg(32, stages=1, warps=4),
             ]
             noncausal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 32,
-                        "BLOCK_M2": 32,
-                        "BLOCK_N2": 32,
-                        "BLK_SLICE_FACTOR": 2,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
+                _bwd_cfg(32, 32, 32, 32, 2, stages=1, warps=4),
             ]
             causal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 32,
-                        "BLOCK_M2": 32,
-                        "BLOCK_N2": 32,
-                        "BLK_SLICE_FACTOR": 2,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
+                _bwd_cfg(32, 32, 32, 32, 2, stages=1, warps=4),
             ]
         else:
             preprocess_configs = [
-                triton.Config(
-                    {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
-                ),
+                _pre_cfg(64, 2, stages=2, warps=8),
             ]
             noncausal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 128,
-                        "BLOCK_M2": 128,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
+                _bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4),
             ]
             causal_configs = [
-                triton.Config(
-                    {
-                        "BLOCK_M1": 32,
-                        "BLOCK_N1": 128,
-                        "BLOCK_M2": 128,
-                        "BLOCK_N2": 64,
-                        "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
+                _bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4),
             ]
 
         # assert constraints
@@ -698,9 +257,7 @@ def get_bwd_configs(mode: AutotuneMode):
                         for n1 in CAUSAL_BLOCK_N1_M2_OPTIONS:
                             m2 = n1
                             for n2 in CAUSAL_BLOCK_N2_OPTIONS:
-                                assert (
-                                    n1 == m2
-                                ), f"BLOCK_N1 ({n1}) must equal BLOCK_M2 ({m2})"
+                                assert n1 == m2, f'BLOCK_N1 ({n1}) must equal BLOCK_M2 ({m2})'
                                 if m2 % n2 != 0:
                                     continue
                                 if n1 % m1 != 0:
@@ -729,9 +286,7 @@ def get_bwd_configs(mode: AutotuneMode):
                         for n1 in NON_CAUSAL_BLOCK_N1_M2_OPTIONS:
                             m2 = n1
                             for n2 in NON_CAUSAL_BLOCK_N2_OPTIONS:
-                                assert (
-                                    n1 == m2
-                                ), f"BLOCK_N1 ({n1}) must equal BLOCK_M2 ({m2})"
+                                assert n1 == m2, f'BLOCK_N1 ({n1}) must equal BLOCK_M2 ({m2})'
                                 if m2 % n2 != 0:
                                     continue
                                 if n1 % m1 != 0:
@@ -2348,18 +1903,10 @@ def attention_backward_triton_impl(
         assert (
             total_seqlen_lse == total_seqlen_q
         ), f"softmax_lse seqlen {total_seqlen_lse} != q seqlen {total_seqlen_q}"
-        assert (
-            cu_seqlens_q is not None
-        ), "cu_seqlens_q must be provided for varlen layout"
-        assert (
-            cu_seqlens_k is not None
-        ), "cu_seqlens_k must be provided for varlen layout"
-        assert (
-            max_seqlen_q is not None
-        ), "max_seqlen_q must be provided for varlen layout"
-        assert (
-            max_seqlen_k is not None
-        ), "max_seqlen_k must be provided for varlen layout"
+        assert cu_seqlens_q is not None, 'cu_seqlens_q must be provided for varlen layout'
+        assert cu_seqlens_k is not None, 'cu_seqlens_k must be provided for varlen layout'
+        assert max_seqlen_q is not None, 'max_seqlen_q must be provided for varlen layout'
+        assert max_seqlen_k is not None, 'max_seqlen_k must be provided for varlen layout'
 
         # assert head dimensions
         assert (
@@ -2371,9 +1918,7 @@ def attention_backward_triton_impl(
         assert (
             nheads_q % nheads_k == 0
         ), f"nheads_q {nheads_q} must be divisible by nheads_k {nheads_k} for GQA/MQA"
-        assert (
-            nheads_lse == nheads_q
-        ), f"softmax_lse heads {nheads_lse} != q heads {nheads_q}"
+        assert nheads_lse == nheads_q, f'softmax_lse heads {nheads_lse} != q heads {nheads_q}'
 
         # assert output shapes
         assert o.shape == (
