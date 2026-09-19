@@ -33,6 +33,11 @@ PREPROCESS_AUTOTUNE_KEYS = [
 # waves_per_eu stays 1 deliberately. 2 is faster at block 64 / long sequences but much
 # slower elsewhere (1.8x at seqlen 8192 block 128, 1.5x at head_dim 128), so it is a
 # genuinely per-shape choice, not a better default.
+#
+# Unlike the forward (see sparse_fwd_default), there is no free rule to key this on:
+# on gfx950 a block-64 backward wants waves_per_eu=2 at head_dim 64, by 1.18-1.32x, but
+# is 1.41x slower with it at head_dim 128; on gfx942 the same setting only wins at the
+# longest sequence. Capturing that needs per-shape measurement, not a better constant.
 SPARSE_BWD_KNOBS = dict(
     BLK_SLICE_FACTOR=1, waves_per_eu=1, num_stages=1, num_warps=4,
     matrix_instr_nonkdim=16,

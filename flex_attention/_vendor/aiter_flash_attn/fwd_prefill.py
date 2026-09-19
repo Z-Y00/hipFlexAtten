@@ -19,6 +19,24 @@ from .utils import (
 # rather than being buried as literals in the launcher.
 SPARSE_FWD_KNOBS = dict(waves_per_eu=2, PRE_LOAD_V=False, num_stages=1, num_warps=4)
 
+
+def sparse_fwd_default(kv_block: int) -> dict:
+    """Block-sparse forward knobs, keyed on architecture and block size.
+
+    waves_per_eu is strongly per-shape, and on gfx950 the split falls cleanly on block
+    size: measured across sequence length and head dim, a block-64 forward is 1.10x
+    faster at seqlen 4096 and 1.15x at 8192 with waves_per_eu=3, while a block-128
+    forward is 1.19-1.33x *slower* with it. Block size is known for free at launch, so
+    that case needs no measurement.
+
+    Only gfx950/block-64 is special-cased -- the one split measured unambiguously, with
+    no shape where it loses (seqlen 2048 and head_dim 128 come out level). gfx942 shows
+    only ~4% for the same change and is left alone.
+    """
+    if get_arch().name == "gfx950" and kv_block <= 64:
+        return dict(waves_per_eu=3, PRE_LOAD_V=False, num_stages=1, num_warps=4)
+    return SPARSE_FWD_KNOBS
+
 FWD_PREFILL_AUTOTUNE_KEYS = [
     "IS_CAUSAL",
     "MAX_SEQLENS_Q",
@@ -1657,7 +1675,7 @@ def attention_forward_prefill_triton_impl(
     )
     if block_sparse is not None:
         launcher = attn_fwd.fn[grid]
-        block_overrides = dict(BLOCK_M=bs_q, BLOCK_N=bs_kv, **SPARSE_FWD_KNOBS)
+        block_overrides = dict(BLOCK_M=bs_q, BLOCK_N=bs_kv, **sparse_fwd_default(bs_kv))
     elif cap_block_m < tuned_block_m:
         if cap_block_m == 0:
             raise ValueError(
