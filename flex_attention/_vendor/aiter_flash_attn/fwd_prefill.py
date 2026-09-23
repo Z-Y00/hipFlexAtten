@@ -194,16 +194,16 @@ fwd_prefill_autotune_configs = get_fwd_prefill_configs(AUTOTUNE)
 
 
 def _extend_fwd_configs(configs):
-    """flex_attention addition: give the forward an actual autotune space.
+    """Give the forward an actual autotune space.
 
-    AITER ships exactly ONE forward config even with AUTOTUNE=on, so nothing was being
-    tuned. A sweep of 144 configs on MI300X (BLOCK_M/N, waves_per_eu, PRE_LOAD_V,
-    num_warps, num_stages) found AITER's tile choice already optimal -- but PRE_LOAD_V=True
-    and num_stages=2 each won on some shapes, worth 2-6%. Add only those few variants:
-    every extra config is benchmarked on the first call for each new shape, so a large
-    space would cost more in warm-up than it returns.
+    The base table ships exactly ONE forward config even with AUTOTUNE=on, so nothing
+    was being tuned. A sweep of 144 configs on MI300X (BLOCK_M/N, waves_per_eu,
+    PRE_LOAD_V, num_warps, num_stages) found that config already optimal on its tile
+    size -- but PRE_LOAD_V=True and num_stages=2 each won on some shapes, worth 2-6%.
+    Add only those few variants: every extra config is benchmarked on the first call
+    for each new shape, so a large space would cost more in warm-up than it returns.
 
-    Only applied when autotuning is enabled; AUTOTUNE=off keeps AITER's single config.
+    Only applied when autotuning is enabled; AUTOTUNE=off keeps the single base config.
     """
     if AUTOTUNE != "on" or FWD_CONF_OVERRIDE is not None or len(configs) != 1:
         return configs
@@ -1321,7 +1321,7 @@ def attn_fwd(
     # We set l_i = 1.0 to avoid division by zero and ensure LSE = -inf.
     invalid_mask = m_i == float("-inf")
 
-    # flex_attention addition (Phase 2): learnable attention sink. The sink is one extra
+    # Learnable attention sink. The sink is one extra
     # per-head logit competing in the softmax with no value vector behind it, so it only
     # enters the denominator. Folding it in here -- after the KV loop, against the final
     # row max -- rather than inside the loop leaves the online rescale untouched and
@@ -1413,8 +1413,7 @@ def attention_forward_prefill_triton_impl(
     max_seqlens_k: int,
     # misc
     use_exp2: bool,
-    # score_mod / mask_mod (Phase 3) and learnable_sink (Phase 2):
-    # flex_attention-specific, not upstream AITER
+    # score_mod / mask_mod and learnable_sink:
     score_mod=None,
     mask_mod=None,
     learnable_sink=None,
@@ -1662,8 +1661,8 @@ def attention_forward_prefill_triton_impl(
             batch * num_splits,
         )
 
-    # flex_attention addition (Phase 4 / MLA): AITER's tuned configs use BLOCK_M=128,
-    # whose Q tile overflows CDNA3's 64 KiB LDS once padded_d_model_qk >= 512. Rather
+    # MLA / large head_dim: the tuned configs use BLOCK_M=128, whose Q tile overflows
+    # CDNA3's 64 KiB LDS once padded_d_model_qk >= 512. Rather
     # than filter the autotuner's config list (triton only runs early_config_prune when
     # more than one config is present, so that would silently miss AUTOTUNE=off), bypass
     # the autotuner and launch the raw JITFunction with a block size that fits. Normal

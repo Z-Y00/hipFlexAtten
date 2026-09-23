@@ -374,8 +374,8 @@ def get_bwd_configs(mode: AutotuneMode):
         return (preprocess_configs, causal_configs, noncausal_configs)
 
 
-# flex_attention fix (not upstream AITER) -----------------------------------------
-# AITER's backward configs all set matrix_instr_nonkdim=16. On gfx942 that forces the
+# matrix_instr_nonkdim miscompile workaround -------------------------------------
+# The tuned backward configs all set matrix_instr_nonkdim=16. On gfx942 that forces the
 # 16x16x16 MFMA, and the AMD Triton backend then miscompiles the accumulating
 # `tl.dot(..., acc=...)` in _bwd_dkdv_inner / _bwd_dq_inner when the dot's K dimension
 # is <= 16: every loop iteration except the last is silently dropped from dK/dV.
@@ -417,9 +417,9 @@ def _sanitize_nonkdim(configs):
 # no diagonal blocks to slice), so its dots never hit the small-K miscompile and it keeps
 # the tuning hint. Applying this to both cost ~5% on non-causal for no correctness gain.
 def _extend_bwd_configs(configs):
-    """flex_attention addition: two extra backward tile shapes for the autotuner.
+    """Two extra backward tile shapes for the autotuner.
 
-    AITER ships 3 non-causal / 2 causal configs. A 216-point sweep on MI300X found these
+    The base table has 3 non-causal / 2 causal configs. A 216-point sweep on MI300X found these
     two beat every shipped config on some shapes, but only by 1.02-1.05x -- the backward
     is close to its config-tuning ceiling, and the remaining gap to peak is not reachable
     by retiling.
@@ -1938,8 +1938,8 @@ def attention_backward_triton_impl(
     use_exp2: bool = True,
     window_size_left: int = -1,
     window_size_right: int = -1,
-    # score_mod / mask_mod (Phase 3, flex_attention-specific -- not upstream AITER).
-    # Only supported on the non-causal "fused" path; see the guard below.
+    # score_mod / mask_mod: only supported on the non-causal "fused" path, see the
+    # guard below.
     score_mod=None,
     mask_mod=None,
     score_mod_bwd=None,
@@ -2234,10 +2234,10 @@ def attention_backward_triton_impl(
     if DEBUG:
         print("delta:", delta, delta.shape)
 
-    # flex_attention addition (Phase 4 / MLA): same 64 KiB LDS cap as the forward, but
-    # here the dominant tiles are sized by BLOCK_N1 (dK/dV) and BLOCK_M2 (dQ). AITER's
-    # tuned configs use 128 for both, which overflows once padded_d_model_qk >= 512.
-    # See fwd_prefill.attention_forward_prefill_triton_impl for why this bypasses the
+    # Same 64 KiB LDS cap as the forward (see max_block_for_lds), but here the
+    # dominant tiles are sized by BLOCK_N1 (dK/dV) and BLOCK_M2 (dQ). The tuned
+    # configs use 128 for both, which overflows once padded_d_model_qk >= 512. See
+    # fwd_prefill.attention_forward_prefill_triton_impl for why this bypasses the
     # autotuner rather than pruning its config list.
     cap_block = max_block_for_lds(padded_d_model_qk, q.element_size())
     tuned_block = max(
@@ -2297,15 +2297,15 @@ def attention_backward_triton_impl(
     else:
 
         def grid(META):
-            # flex_attention fix: the fused backward runs two phases off the same
-            # program id -- dK/dV strides by BLOCK_N1, dQ by BLOCK_M2 -- so the grid
+            # The fused backward runs two phases off the same program id --
+            # dK/dV strides by BLOCK_N1, dQ by BLOCK_M2 -- so the grid
             # must cover whichever needs more programs. Upstream sized it by BLOCK_N1
             # alone, which silently computes only the first
             # (seqlen/BLOCK_N1)*BLOCK_M2 rows of dQ whenever BLOCK_M2 < BLOCK_N1.
-            # Every config AITER ships happens to satisfy BLOCK_M2 >= BLOCK_N1, so
-            # the latent bug never fired for them; it blocks otherwise-faster tile
-            # shapes from the autotune space. Both phases already guard their own
-            # program id, so over-provisioning is safe.
+            # Every shipped config happens to satisfy BLOCK_M2 >= BLOCK_N1, so the
+            # latent bug never fired for them; it blocks otherwise-faster tile shapes
+            # from the autotune space. Both phases already guard their own program
+            # id, so over-provisioning is safe.
             step = min(META["BLOCK_N1"], META["BLOCK_M2"])
             return (nheads_k, ((seqlen + step - 1) // step), batch)
 

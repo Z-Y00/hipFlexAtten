@@ -93,10 +93,9 @@ def _check_unsupported(
 
     # NOTE: causal + window_size, causal + score_mod/mask_mod, and asymmetric head dims
     # with causal/deterministic were all rejected here previously. They now work: the
-    # backward always uses AITER's "fused" kernels, which carry separate QK/V head dims,
-    # support window_size, are where score_mod/mask_mod are instrumented, and are
-    # correct for causal now that the matrix_instr_nonkdim miscompile is patched out
-    # (see _sanitize_nonkdim in bwd.py).
+    # backward kernels carry separate QK/V head dims, support window_size, are where
+    # score_mod/mask_mod are instrumented, and are correct for causal now that the
+    # matrix_instr_nonkdim miscompile is patched out (see _sanitize_nonkdim in bwd.py).
     if score_mod_bwd is not None and score_mod is None:
         raise ValueError("score_mod_bwd was given without score_mod")
     if softcap != 0.0 and score_mod is not None:
@@ -238,12 +237,10 @@ class _FlashAttnFunc(torch.autograd.Function):
         dk = torch.zeros_like(k)
         dv = torch.zeros_like(v)
 
-        # The backward always uses AITER's "fused" kernels (the only mode; "split" and
-        # "fused_atomic" were dead code and have been deleted): it is correct for causal
-        # and non-causal alike now that the matrix_instr_nonkdim miscompile is patched
-        # out (see _sanitize_nonkdim in bwd.py), it carries separate QK/V head dims,
-        # supports window_size, is where score_mod/mask_mod are instrumented, and is
-        # bitwise deterministic. So `deterministic` needs no separate path.
+        # There is only one backward kernel path (no atomics anywhere in it), and it is
+        # deterministic and correct for causal and non-causal alike now that the
+        # matrix_instr_nonkdim miscompile is patched out (see _sanitize_nonkdim in
+        # bwd.py). So `deterministic` needs no separate path.
 
         # Block-sparse backward lists. dQ sweeps KV blocks per Q block (the forward
         # direction); dK/dV sweeps Q blocks per KV block (its transpose). Both use the
@@ -337,9 +334,8 @@ def flash_attn_func(
     no-op here: GQA/MQA is handled by plain head-index broadcast in both the forward and
     backward Triton kernels, which needs no explicit "packing" step on AMD.
     ``deterministic`` is accepted for signature compatibility but is a no-op: the
-    backward always uses AITER's "fused" kernels, which write each output tile from a
-    single program (the atomics live in AITER's separate "fused_atomic" mode, which this
-    project never uses) and were verified bitwise-identical across repeated runs. So the
+    backward kernels write each output tile from a single program, with no atomics
+    anywhere in them, and were verified bitwise-identical across repeated runs. So the
     backward is always deterministic, and there is no slower alternative path to select.
     ``num_splits`` > 1 slices the KV loop across programs and reduces the partials
     afterwards. It changes only *how* the forward is evaluated -- the output and LSE are

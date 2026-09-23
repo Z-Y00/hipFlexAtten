@@ -78,8 +78,8 @@ class GpuArch:
 # -------------------------------
 # Global Variables
 # -------------------------------
-# --- flex_attention addition (Phase 4 / MLA), not upstream AITER ---------------
-# CDNA3 (gfx942) gives 64 KiB of LDS per workgroup. AITER's tuned configs assume
+# --- MLA / large head_dim: LDS budget -------------------------------------------
+# CDNA3 (gfx942) gives 64 KiB of LDS per workgroup. The tuned configs assume
 # head_dim <= 256, where the Q tile always fits; MLA shapes (head_dim_v up to 512,
 # head_dim_qk up to 512) overflow it. Measured on MI300X, Triton's reported LDS
 # requirement for attn_fwd is exactly BLOCK_M * padded_head_dim_qk * elem_size
