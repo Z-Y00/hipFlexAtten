@@ -1,17 +1,16 @@
 """Public API mirroring flash_attn.cute.interface's flash_attn_func / flash_attn_varlen_func,
-backed by a Triton/AMD (CDNA3/MI300) implementation: AITER's own fwd_prefill + bwd
-kernels for both passes (see flex_attention/_vendor/aiter_flash_attn/NOTICE.md for
-provenance -- an earlier version used a different, Primus-Turbo-derived backward, but
-that recomputed QK^T twice per tile pair and benchmarked ~1.3-1.8x slower; see the
-NOTICE for details). See /home/lorri/.claude/plans/piped-painting-nebula.md for the
-overall port plan.
+backed by a Triton/AMD (CDNA3/MI300X, CDNA4/MI355X) implementation: AITER's own
+fwd_prefill + bwd kernels for both passes (see
+flex_attention/_vendor/aiter_flash_attn/NOTICE.md for provenance -- an earlier version
+used a different, Primus-Turbo-derived backward, but that recomputed QK^T twice per tile
+pair and benchmarked ~1.3-1.8x slower; see the NOTICE for details).
 
-Supported: causal, varlen, GQA/MQA, sliding window, return_lse, forward+backward
-(Phase 1); softcap and learnable_sink (Phase 2); score_mod / mask_mod / score_mod_bwd
-(Phase 3); MLA and other large or asymmetric head dims up to 576/512 (Phase 4);
-block-sparse attention (Phase 5, dense layout only). Still unsupported, raising a clear
-NotImplementedError: qv / gather_kv_indices (top-k sparse KV) and num_splits > 1 under
-varlen.
+Supported: causal, varlen, GQA/MQA, sliding window, return_lse, forward+backward;
+softcap and learnable_sink; score_mod / mask_mod / score_mod_bwd; MLA and other large or
+asymmetric head dims up to 576/512; block-sparse attention (dense and varlen, composes
+with causal -- see flex_attention.block_sparse and flex_attention.tuning). Still
+unsupported, raising a clear NotImplementedError: qv / gather_kv_indices (top-k sparse
+KV) and num_splits > 1 under varlen.
 
 All supported features compose freely (causal with window_size, score_mod and MLA head
 dims together, and so on). Earlier revisions rejected several such combinations; those

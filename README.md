@@ -15,8 +15,9 @@ Built on [ROCm/aiter](https://github.com/ROCm/aiter)'s Triton flash-attention ke
 
 ## Status
 
-Developed and tested on **MI300X (gfx942 / CDNA3)**, ROCm 7, Triton 3.5, PyTorch 2.9.
-115 tests pass. Other CDNA parts are untested; RDNA is not a target.
+Developed and tested on **MI300X (gfx942 / CDNA3)**, ROCm 7, Triton 3.5, PyTorch 2.9, and
+verified on **MI355X (gfx950)**, ROCm 7.15, Triton 3.8, PyTorch 2.12. 133 tests pass on
+both. RDNA is not a target.
 
 ## Install
 
@@ -95,7 +96,29 @@ The two must express the same predicate: the block mask decides which blocks are
 
 Empty blocks are skipped, fully-unmasked blocks skip masking entirely, and partial blocks
 apply `mask_mod`. `create_block_sparse_varlen` builds the same thing for varlen (indices
-are sequence-local). See [when this actually helps](#block-sparse-1).
+are sequence-local). `causal=True` composes with `block_sparse_tensors` in both layouts —
+blocks past the diagonal are dropped, straddling ones move onto the masked pass — so you
+don't have to fold causality into your own mask_mod. See
+[when this actually helps](#block-sparse-1).
+
+### Picking a block size
+
+The best block size for a sparse mask isn't predictable from the pattern alone — it's a
+real tradeoff (bigger tiles are faster per-tile but coarser, so more masked-out work gets
+dragged in) that flips depending on shape. `tune_block_plan` measures the candidates once
+and picks the fastest, including a dense candidate when the mask happens to be exactly
+causal:
+
+```python
+from flex_attention import tune_block_plan, flash_attn_func
+
+result = tune_block_plan(my_mask_fn, q, k, v, causal=True)
+print(result)                                   # per-candidate timings
+out = result.apply(flash_attn_func, q, k, v, causal=True)
+```
+
+A block size that can't represent the mask exactly (a predicate that varies inside a
+tile, with no `mask_mod` to resolve it) is rejected rather than silently mismeasured.
 
 ### Split-KV
 
@@ -249,12 +272,13 @@ split backward kernels; they were replaced after benchmarking and are no longer 
 flex_attention/
   interface.py        public API (flash_attn_func / flash_attn_varlen_func)
   mods.py             ready-made score_mod / mask_mod builders
-  block_sparse.py     block-mask metadata and its backward transpose
+  block_sparse.py     block-mask metadata (BlockPlan/BlockCategory) and its backward transpose
+  tuning.py           tune_block_plan: measure block-size/dense-vs-sparse candidates, pick the fastest
   split_combine.py    split-KV reduction
   _vendor/            vendored AITER kernels + NOTICE
   _experimental/      standalone prototypes kept as executable documentation
-tests/                115 tests, all against a PyTorch-eager reference
-bench/                MI300X benchmarks
+tests/                133 tests, all against a PyTorch-eager reference
+bench/                MI300X/MI355X benchmarks
 ```
 
 There is no NVIDIA box in the loop, and FA-4 itself cannot run on AMD, so a plain

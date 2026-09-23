@@ -1,4 +1,4 @@
-"""Block-sparse attention metadata (Phase 5), object-oriented.
+"""Block-sparse attention metadata, object-oriented.
 
 A block mask partitions the (query, key) grid into blocks and classifies each one into a
 :class:`BlockCategory`:
