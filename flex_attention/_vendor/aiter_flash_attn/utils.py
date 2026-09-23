@@ -29,6 +29,7 @@ __all__ = [
     "AutotuneMode",
     # Runtime info
     "get_arch",
+    "bs_tensor_strides",
     "pick_knobs",
     "time_launch",
 ]
@@ -226,6 +227,25 @@ def pick_knobs(cache: dict, key, candidates, launch):
         best = candidates[0]  # nothing measured; fall back and let the real launch raise
     cache[key] = best
     return best
+
+
+def bs_tensor_strides(prefix: str, tensor) -> dict:
+    """Kwargs for one block-sparse list's (batch, head, row) strides.
+
+    All the launchers pass block-sparse count/index tensors to the kernel as a flat
+    pointer plus separate stride_*_b/_h/_m kwargs (Triton kernels take plain pointers,
+    not tensor objects, so the strides have to travel alongside). ``tensor`` is one of
+    those count/index tensors, or None when this call has no block-sparse list of this
+    kind -- the kernel then never dereferences the corresponding pointer, so the actual
+    stride values don't matter, only that they're present and valid ints.
+    """
+    if tensor is None:
+        return {f"stride_{prefix}_b": 0, f"stride_{prefix}_h": 0, f"stride_{prefix}_m": 0}
+    return {
+        f"stride_{prefix}_b": tensor.stride(0),
+        f"stride_{prefix}_h": tensor.stride(1),
+        f"stride_{prefix}_m": tensor.stride(2),
+    }
 
 
 @triton.jit
