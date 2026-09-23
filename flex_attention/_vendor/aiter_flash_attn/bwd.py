@@ -1954,60 +1954,17 @@ def attention_backward_triton_impl(
         batch = len(cu_seqlens_q) - 1
         head_size_qk = head_size_q
 
-        # strides
-        stride_qb, stride_qm, stride_qh, stride_qd = (
-            0,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-        )
-        stride_kb, stride_kn, stride_kh, stride_kd = (
-            0,
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-        )
-        stride_vb, stride_vn, stride_vh, stride_vd = (
-            0,
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-        )
-        stride_ob, stride_om, stride_oh, stride_od = (
-            0,
-            o.stride(0),
-            o.stride(1),
-            o.stride(2),
-        )
-        stride_dqb, stride_dqm, stride_dqh, stride_dqd = (
-            0,
-            dq.stride(0),
-            dq.stride(1),
-            dq.stride(2),
-        )
-        stride_dkb, stride_dkn, stride_dkh, stride_dkd = (
-            0,
-            dk.stride(0),
-            dk.stride(1),
-            dk.stride(2),
-        )
-        stride_dvb, stride_dvn, stride_dvh, stride_dvd = (
-            0,
-            dv.stride(0),
-            dv.stride(1),
-            dv.stride(2),
-        )
-        stride_dob, stride_dom, stride_doh, stride_dod = (
-            0,
-            do.stride(0),
-            do.stride(1),
-            do.stride(2),
-        )
-        stride_lse_b, stride_lse_h, stride_lse_m = (
-            0,
-            softmax_lse.stride(0),
-            softmax_lse.stride(1),
-        )
+        # strides -- leading 0 stands in for the batch stride varlen has no true axis
+        # for (all sequences are packed along dim 0; cu_seqlens carries the offsets).
+        stride_qb, stride_qm, stride_qh, stride_qd = (0, *q.stride())
+        stride_kb, stride_kn, stride_kh, stride_kd = (0, *k.stride())
+        stride_vb, stride_vn, stride_vh, stride_vd = (0, *v.stride())
+        stride_ob, stride_om, stride_oh, stride_od = (0, *o.stride())
+        stride_dqb, stride_dqm, stride_dqh, stride_dqd = (0, *dq.stride())
+        stride_dkb, stride_dkn, stride_dkh, stride_dkd = (0, *dk.stride())
+        stride_dvb, stride_dvn, stride_dvh, stride_dvd = (0, *dv.stride())
+        stride_dob, stride_dom, stride_doh, stride_dod = (0, *do.stride())
+        stride_lse_b, stride_lse_h, stride_lse_m = (0, *softmax_lse.stride())
     else:
         # shapes
         batch_q, seqlen_q, nheads_q, head_size_q = q.shape

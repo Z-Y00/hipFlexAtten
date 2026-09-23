@@ -1451,36 +1451,13 @@ def attention_forward_prefill_triton_impl(
         ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
         assert softmax_lse.device == q.device, "softmax_lse must be on same device as q"
 
-        # strides
-        stride_qb, stride_qh, stride_qm, stride_qd = (
-            0,
-            q.stride(1),
-            q.stride(0),
-            q.stride(2),
-        )
-        stride_kb, stride_kh, stride_kn, stride_kd = (
-            0,
-            k.stride(1),
-            k.stride(0),
-            k.stride(2),
-        )
-        stride_vb, stride_vh, stride_vn, stride_vd = (
-            0,
-            v.stride(1),
-            v.stride(0),
-            v.stride(2),
-        )
-        stride_ob, stride_oh, stride_om, stride_od = (
-            0,
-            o.stride(1),
-            o.stride(0),
-            o.stride(2),
-        )
-        stride_lse_z, stride_lse_h, stride_lse_m = (
-            0,
-            softmax_lse.stride(0),
-            softmax_lse.stride(1),
-        )
+        # strides -- variable order is (b, h, m, d); varlen tensors store (m, h, d)
+        # (no batch axis; cu_seqlens carries the per-sequence offsets), hence the swap.
+        stride_qb, stride_qh, stride_qm, stride_qd = 0, q.stride(1), q.stride(0), q.stride(2)
+        stride_kb, stride_kh, stride_kn, stride_kd = 0, k.stride(1), k.stride(0), k.stride(2)
+        stride_vb, stride_vh, stride_vn, stride_vd = 0, v.stride(1), v.stride(0), v.stride(2)
+        stride_ob, stride_oh, stride_om, stride_od = 0, o.stride(1), o.stride(0), o.stride(2)
+        stride_lse_z, stride_lse_h, stride_lse_m = 0, *softmax_lse.stride()
     else:
         # shapes
         batch_q, seqlen_q, nheads_q, head_size_q = q.shape
@@ -1537,31 +1514,12 @@ def attention_forward_prefill_triton_impl(
         ), f"softmax_lse must be float32, got {softmax_lse.dtype}"
         assert softmax_lse.device == q.device, "softmax_lse must be on same device as q"
 
-        # strides
-        stride_qb, stride_qh, stride_qm, stride_qd = (
-            q.stride(0),
-            q.stride(2),
-            q.stride(1),
-            q.stride(3),
-        )
-        stride_kb, stride_kh, stride_kn, stride_kd = (
-            k.stride(0),
-            k.stride(2),
-            k.stride(1),
-            k.stride(3),
-        )
-        stride_vb, stride_vh, stride_vn, stride_vd = (
-            v.stride(0),
-            v.stride(2),
-            v.stride(1),
-            v.stride(3),
-        )
-        stride_ob, stride_oh, stride_om, stride_od = (
-            o.stride(0),
-            o.stride(2),
-            o.stride(1),
-            o.stride(3),
-        )
+        # strides -- variable order is (b, h, m, d); bshd tensors store (b, m, h, d),
+        # hence the h/m swap.
+        stride_qb, stride_qh, stride_qm, stride_qd = q.stride(0), q.stride(2), q.stride(1), q.stride(3)
+        stride_kb, stride_kh, stride_kn, stride_kd = k.stride(0), k.stride(2), k.stride(1), k.stride(3)
+        stride_vb, stride_vh, stride_vn, stride_vd = v.stride(0), v.stride(2), v.stride(1), v.stride(3)
+        stride_ob, stride_oh, stride_om, stride_od = o.stride(0), o.stride(2), o.stride(1), o.stride(3)
         stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
 
     # check output dtype matches input dtype
