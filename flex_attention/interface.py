@@ -113,6 +113,61 @@ def _check_unsupported(
         )
 
 
+def _validate_and_resolve_mods(
+    q,
+    k,
+    v,
+    qv,
+    gather_kv_indices,
+    learnable_sink,
+    softcap,
+    score_mod,
+    score_mod_bwd,
+    mask_mod,
+    aux_tensors,
+    aux_scalars,
+    block_sparse_tensors,
+    block_sparse_tensors_bwd,
+    causal,
+    window_size,
+    num_splits,
+    deterministic,
+):
+    """Shared entry-point validation for flash_attn_func / flash_attn_varlen_func.
+
+    Both call this with the same arguments before dispatching to _FlashAttnFunc.apply,
+    so a new restriction only needs stating once. Returns the (score_mod, score_mod_bwd)
+    pair to actually use -- softcap resolves to its own score_mod/score_mod_bwd pair,
+    overriding whatever was passed in (mutually exclusive, already enforced by
+    _check_unsupported above).
+    """
+    _check_unsupported(
+        qv,
+        gather_kv_indices,
+        learnable_sink,
+        softcap,
+        score_mod,
+        score_mod_bwd,
+        mask_mod,
+        aux_tensors,
+        aux_scalars,
+        block_sparse_tensors,
+        block_sparse_tensors_bwd,
+        causal,
+        window_size,
+        requires_grad=torch.is_grad_enabled()
+        and (q.requires_grad or k.requires_grad or v.requires_grad),
+        head_dim_qk=q.shape[-1],
+        head_dim_v=v.shape[-1],
+        deterministic=deterministic,
+    )
+    if num_splits < 1:
+        raise ValueError(f"num_splits must be >= 1, got {num_splits}")
+    if softcap != 0.0:
+        return make_softcap_score_mod(softcap)
+    return score_mod, score_mod_bwd
+
+
 class _FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -357,32 +412,11 @@ def flash_attn_func(
     the ``causal``/``window_size`` flags are bottom-right aligned; they agree when
     seqlen_q == seqlen_k).
     """
-    _check_unsupported(
-        qv,
-        gather_kv_indices,
-        learnable_sink,
-        softcap,
-        score_mod,
-        score_mod_bwd,
-        mask_mod,
-        aux_tensors,
-        aux_scalars,
-        block_sparse_tensors,
-        block_sparse_tensors_bwd,
-        causal,
-        window_size,
-        requires_grad=torch.is_grad_enabled()
-        and (q.requires_grad or k.requires_grad or v.requires_grad),
-        head_dim_qk=q.shape[-1],
-        head_dim_v=v.shape[-1],
-        deterministic=deterministic,
+    score_mod, score_mod_bwd = _validate_and_resolve_mods(
+        q, k, v, qv, gather_kv_indices, learnable_sink, softcap, score_mod, score_mod_bwd,
+        mask_mod, aux_tensors, aux_scalars, block_sparse_tensors, block_sparse_tensors_bwd,
+        causal, window_size, num_splits, deterministic,
     )
-    if num_splits < 1:
-        raise ValueError(f"num_splits must be >= 1, got {num_splits}")
-
-    if softcap != 0.0:
-        score_mod, score_mod_bwd = make_softcap_score_mod(softcap)
-
     o, lse = _FlashAttnFunc.apply(
         q, k, v, softmax_scale, causal, window_size, deterministic, return_lse,
         None, None, None, None, score_mod, mask_mod, score_mod_bwd, learnable_sink,
@@ -427,32 +461,11 @@ def flash_attn_varlen_func(
     and ``b`` is the batch index within cu_seqlens -- so a causal mask_mod works
     unchanged across varlen and dense.
     """
-    _check_unsupported(
-        qv,
-        gather_kv_indices,
-        learnable_sink,
-        softcap,
-        score_mod,
-        score_mod_bwd,
-        mask_mod,
-        aux_tensors,
-        aux_scalars,
-        block_sparse_tensors,
-        block_sparse_tensors_bwd,
-        causal,
-        window_size,
-        requires_grad=torch.is_grad_enabled()
-        and (q.requires_grad or k.requires_grad or v.requires_grad),
-        head_dim_qk=q.shape[-1],
-        head_dim_v=v.shape[-1],
-        deterministic=deterministic,
+    score_mod, score_mod_bwd = _validate_and_resolve_mods(
+        q, k, v, qv, gather_kv_indices, learnable_sink, softcap, score_mod, score_mod_bwd,
+        mask_mod, aux_tensors, aux_scalars, block_sparse_tensors, block_sparse_tensors_bwd,
+        causal, window_size, num_splits, deterministic,
     )
-    if num_splits < 1:
-        raise ValueError(f"num_splits must be >= 1, got {num_splits}")
-
-    if softcap != 0.0:
-        score_mod, score_mod_bwd = make_softcap_score_mod(softcap)
-
     o, lse = _FlashAttnFunc.apply(
         q,
         k,
