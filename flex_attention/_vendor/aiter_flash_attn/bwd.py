@@ -119,167 +119,101 @@ def _pre_cfg(pre_block, waves=None, *, stages, warps):
     return triton.Config(kw, num_stages=stages, num_warps=warps)
 
 
+def _bwd_configs_full(arch):
+    """Every candidate (preprocess, causal, noncausal) config list for ``arch``, most-tuned
+    first. "off" mode is always exactly these lists truncated to their first entry -- see
+    get_bwd_configs.
+    """
+    if arch.name == "gfx942" and arch.cu_count < 304:
+        preprocess = [
+            _pre_cfg(64, 1, stages=1, warps=8),
+            _pre_cfg(64, 2, stages=2, warps=8),
+            _pre_cfg(128, 2, stages=1, warps=4),
+        ]
+        noncausal = [
+            _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
+            _bwd_cfg(64, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
+            _bwd_cfg(32, 128, 128, 32, 2, 2, 16, stages=1, warps=8),
+            _bwd_cfg(32, 128, 128, 32, 2, 1, 16, stages=1, warps=8),
+        ]
+        causal = [
+            _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
+            _bwd_cfg(64, 64, 64, 64, 2, 1, 16, stages=1, warps=4),
+            _bwd_cfg(32, 64, 64, 64, 2, 1, 16, stages=1, warps=4),
+        ]
+    elif arch.name == "gfx942":  # cu_count >= 304
+        preprocess = [
+            _pre_cfg(64, 2, stages=2, warps=8),
+            _pre_cfg(64, 1, stages=1, warps=4),
+        ]
+        noncausal = [
+            _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
+            _bwd_cfg(64, 64, 64, 64, 2, 1, 16, stages=1, warps=4),
+            _bwd_cfg(32, 64, 64, 64, 2, 2, 16, stages=1, warps=4),
+            # Two-stage variants, absent upstream: every tuned entry above pins
+            # stages=1. Found by letting the autotuner loose on the (unreachable)
+            # sweep space, worth 1.17x at head_dim 64 / seqlen 4096 and 1.10x at
+            # 8192, neutral elsewhere. Added as candidates rather than as a new
+            # default -- the autotuner benchmarks them per shape, so a shape they
+            # do not suit just keeps the config it already had.
+            _bwd_cfg(32, 128, 128, 64, 2, 2, stages=2, warps=4),
+            _bwd_cfg(32, 128, 128, 64, 2, 1, stages=2, warps=4),
+            _bwd_cfg(64, 128, 128, 64, 2, 2, stages=2, warps=4),
+            _bwd_cfg(64, 128, 128, 64, 2, 1, stages=2, warps=4),
+        ]
+        causal = [
+            _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
+            _bwd_cfg(32, 64, 64, 64, 2, 1, 16, stages=1, warps=4),
+        ]
+    elif arch.name == "gfx950":
+        preprocess = [
+            _pre_cfg(64, 2, stages=2, warps=8),
+            _pre_cfg(64, 2, stages=1, warps=8),
+            _pre_cfg(64, 2, stages=2, warps=4),
+        ]
+        noncausal = [
+            _bwd_cfg(64, 128, 128, 64, 2, 1, stages=1, warps=4),
+            _bwd_cfg(64, 128, 128, 128, 2, 1, stages=1, warps=4),
+            _bwd_cfg(64, 64, 64, 64, 2, 1, stages=1, warps=4),
+            _bwd_cfg(16, 64, 64, 64, 2, 2, stages=1, warps=4),
+            _bwd_cfg(32, 256, 256, 64, 2, 1, stages=2, warps=8),
+            _bwd_cfg(32, 256, 256, 64, 2, 2, stages=2, warps=8),
+            # mid-tile, 2-stage variant
+            _bwd_cfg(32, 128, 128, 64, 2, 2, stages=2, warps=4),
+        ]
+        causal = [
+            _bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4),
+            _bwd_cfg(64, 64, 64, 64, 2, 1, stages=1, warps=4),
+            _bwd_cfg(32, 128, 128, 64, 2, 1, stages=2, warps=4),
+            _bwd_cfg(32, 128, 128, 64, 2, 2, stages=2, warps=4),
+            # larger-tile variant (helps long-seq throughput; noncausal-proven)
+            _bwd_cfg(32, 256, 256, 64, 2, 2, stages=2, warps=8),
+            # small-tile variant (helps short seqlen / wide-window cases)
+            _bwd_cfg(16, 64, 64, 64, 2, 2, stages=1, warps=4),
+        ]
+    elif arch.is_rdna:
+        preprocess = [_pre_cfg(32, stages=1, warps=4)]
+        noncausal = [_bwd_cfg(32, 32, 32, 32, 2, stages=1, warps=4)]
+        causal = [_bwd_cfg(32, 32, 32, 32, 2, stages=1, warps=4)]
+    else:
+        preprocess = [_pre_cfg(64, 2, stages=2, warps=8)]
+        noncausal = [_bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4)]
+        causal = [_bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4)]
+
+    for cfg in (*noncausal, *causal):
+        kw = cfg.all_kwargs()
+        assert kw["BLOCK_N1"] == kw["BLOCK_M2"], (
+            f"BLOCK_N1 ({kw['BLOCK_N1']}) must equal BLOCK_M2 ({kw['BLOCK_M2']})"
+        )
+    return preprocess, causal, noncausal
+
+
 def get_bwd_configs(mode: AutotuneMode):
-
-    if mode == "off":
-        arch = get_arch()
-        if arch.name == "gfx942":
-            if arch.cu_count < 304:
-                preprocess_configs = [
-                    _pre_cfg(64, 1, stages=1, warps=8),
-                ]
-                noncausal_configs = [
-                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
-                ]
-                causal_configs = [
-                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
-                ]
-            else:
-                preprocess_configs = [
-                    _pre_cfg(64, 2, stages=2, warps=8),
-                ]
-                noncausal_configs = [
-                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
-                ]
-                causal_configs = [
-                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
-                ]
-        elif arch.name == "gfx950":
-            preprocess_configs = [
-                _pre_cfg(64, 2, stages=2, warps=8),
-            ]
-            noncausal_configs = [
-                _bwd_cfg(64, 128, 128, 64, 2, 1, stages=1, warps=4),
-            ]
-            causal_configs = [
-                _bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4),
-            ]
-        elif arch.is_rdna:
-            preprocess_configs = [
-                _pre_cfg(32, stages=1, warps=4),
-            ]
-            noncausal_configs = [
-                _bwd_cfg(32, 32, 32, 32, 2, stages=1, warps=4),
-            ]
-            causal_configs = [
-                _bwd_cfg(32, 32, 32, 32, 2, stages=1, warps=4),
-            ]
-        else:
-            preprocess_configs = [
-                _pre_cfg(64, 2, stages=2, warps=8),
-            ]
-            noncausal_configs = [
-                _bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4),
-            ]
-            causal_configs = [
-                _bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4),
-            ]
-        return (preprocess_configs, causal_configs, noncausal_configs)
-
-    elif mode == "on":
-        arch = get_arch()
-        if arch.name == "gfx942":
-            if arch.cu_count < 304:
-                preprocess_configs = [
-                    _pre_cfg(64, 1, stages=1, warps=8),
-                    _pre_cfg(64, 2, stages=2, warps=8),
-                    _pre_cfg(128, 2, stages=1, warps=4),
-                ]
-                noncausal_configs = [
-                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
-                    _bwd_cfg(64, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
-                    _bwd_cfg(32, 128, 128, 32, 2, 2, 16, stages=1, warps=8),
-                    _bwd_cfg(32, 128, 128, 32, 2, 1, 16, stages=1, warps=8),
-                ]
-                causal_configs = [
-                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
-                    _bwd_cfg(64, 64, 64, 64, 2, 1, 16, stages=1, warps=4),
-                    _bwd_cfg(32, 64, 64, 64, 2, 1, 16, stages=1, warps=4),
-                ]
-            else:
-                preprocess_configs = [
-                    _pre_cfg(64, 2, stages=2, warps=8),
-                    _pre_cfg(64, 1, stages=1, warps=4),
-                ]
-                noncausal_configs = [
-                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
-                    _bwd_cfg(64, 64, 64, 64, 2, 1, 16, stages=1, warps=4),
-                    _bwd_cfg(32, 64, 64, 64, 2, 2, 16, stages=1, warps=4),
-                    # Two-stage variants, absent upstream: every tuned entry above
-                    # pins stages=1. Found by letting the autotuner loose on the
-                    # (unreachable) sweep space, worth 1.17x at head_dim 64 /
-                    # seqlen 4096 and 1.10x at 8192, neutral elsewhere. Added as
-                    # candidates rather than as a new default -- the autotuner
-                    # benchmarks them per shape, so a shape they do not suit just
-                    # keeps the config it already had.
-                    _bwd_cfg(32, 128, 128, 64, 2, 2, stages=2, warps=4),
-                    _bwd_cfg(32, 128, 128, 64, 2, 1, stages=2, warps=4),
-                    _bwd_cfg(64, 128, 128, 64, 2, 2, stages=2, warps=4),
-                    _bwd_cfg(64, 128, 128, 64, 2, 1, stages=2, warps=4),
-                ]
-                causal_configs = [
-                    _bwd_cfg(32, 128, 128, 64, 2, 1, 16, stages=1, warps=4),
-                    _bwd_cfg(32, 64, 64, 64, 2, 1, 16, stages=1, warps=4),
-                ]
-        elif arch.name == "gfx950":
-            preprocess_configs = [
-                _pre_cfg(64, 2, stages=2, warps=8),
-                _pre_cfg(64, 2, stages=1, warps=8),
-                _pre_cfg(64, 2, stages=2, warps=4),
-            ]
-            noncausal_configs = [
-                _bwd_cfg(64, 128, 128, 64, 2, 1, stages=1, warps=4),
-                _bwd_cfg(64, 128, 128, 128, 2, 1, stages=1, warps=4),
-                _bwd_cfg(64, 64, 64, 64, 2, 1, stages=1, warps=4),
-                _bwd_cfg(16, 64, 64, 64, 2, 2, stages=1, warps=4),
-                _bwd_cfg(32, 256, 256, 64, 2, 1, stages=2, warps=8),
-                _bwd_cfg(32, 256, 256, 64, 2, 2, stages=2, warps=8),
-                # mid-tile, 2-stage variant
-                _bwd_cfg(32, 128, 128, 64, 2, 2, stages=2, warps=4),
-            ]
-            causal_configs = [
-                _bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4),
-                _bwd_cfg(64, 64, 64, 64, 2, 1, stages=1, warps=4),
-                _bwd_cfg(32, 128, 128, 64, 2, 1, stages=2, warps=4),
-                _bwd_cfg(32, 128, 128, 64, 2, 2, stages=2, warps=4),
-                # larger-tile variant (helps long-seq throughput; noncausal-proven)
-                _bwd_cfg(32, 256, 256, 64, 2, 2, stages=2, warps=8),
-                # small-tile variant (helps short seqlen / wide-window cases)
-                _bwd_cfg(16, 64, 64, 64, 2, 2, stages=1, warps=4),
-            ]
-        elif arch.is_rdna:
-            preprocess_configs = [
-                _pre_cfg(32, stages=1, warps=4),
-            ]
-            noncausal_configs = [
-                _bwd_cfg(32, 32, 32, 32, 2, stages=1, warps=4),
-            ]
-            causal_configs = [
-                _bwd_cfg(32, 32, 32, 32, 2, stages=1, warps=4),
-            ]
-        else:
-            preprocess_configs = [
-                _pre_cfg(64, 2, stages=2, warps=8),
-            ]
-            noncausal_configs = [
-                _bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4),
-            ]
-            causal_configs = [
-                _bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4),
-            ]
-
-        # assert constraints
-        for noncausal_cfg, causal_cfg in zip(noncausal_configs, causal_configs):
-            assert (
-                noncausal_cfg.all_kwargs()["BLOCK_N1"]
-                == noncausal_cfg.all_kwargs()["BLOCK_M2"]
-            ), f"BLOCK_N1 ({noncausal_cfg.all_kwargs()['BLOCK_N1']}) must equal BLOCK_M2 ({noncausal_cfg.all_kwargs()['BLOCK_M2']})"
-            assert (
-                causal_cfg.all_kwargs()["BLOCK_N1"]
-                == causal_cfg.all_kwargs()["BLOCK_M2"]
-            ), f"BLOCK_N1 ({causal_cfg.all_kwargs()['BLOCK_N1']}) must equal BLOCK_M2 ({causal_cfg.all_kwargs()['BLOCK_M2']})"
-
-        return (preprocess_configs, causal_configs, noncausal_configs)
+    if mode in ("off", "on"):
+        preprocess, causal, noncausal = _bwd_configs_full(get_arch())
+        if mode == "off":
+            return preprocess[:1], causal[:1], noncausal[:1]
+        return preprocess, causal, noncausal
 
     else:  # sweep
         PRE_BLOCK_OPTIONS = [64, 128]

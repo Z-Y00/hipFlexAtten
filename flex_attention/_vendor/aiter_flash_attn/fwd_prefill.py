@@ -77,90 +77,46 @@ def _fwd_cfg(m, n, waves, preload_v, *, stages, warps):
     )
 
 
+def _fwd_configs_full(arch) -> list:
+    """Every candidate config for ``arch``, most-tuned first.
+
+    "off" mode is always exactly this list truncated to its first entry, since a
+    single fast default is what "off" means -- see get_fwd_prefill_configs.
+    """
+    if FWD_CONF_OVERRIDE:
+        return [FWD_CONF_OVERRIDE]
+    if arch.name == "gfx950":
+        return [
+            _fwd_cfg(128, 64, 2, False, stages=1, warps=4),
+            _fwd_cfg(128, 64, 2, False, stages=1, warps=2),
+            _fwd_cfg(128, 64, 2, False, stages=2, warps=4),
+            _fwd_cfg(128, 128, 2, False, stages=2, warps=4),
+        ]
+    if arch.name == "gfx942":
+        return [_fwd_cfg(128, 64, 2, False, stages=1, warps=4)]
+    if arch.is_rdna:
+        # gfx1151 (Strix Halo / RDNA3.5): tuned for the Qwen3-Omni ViT prefill shape
+        # (B=1, S=3200, H=16, head_dim=72, fp16).
+        if arch.name == "gfx1151":
+            return [_fwd_cfg(128, 64, 2, False, stages=1, warps=8)]
+        # NOTE: Tests expect BLOCK_N=32 for RDNA (except gfx1100); see
+        # _get_block_size_n_triton() in test_flash_attn_triton_amd.py
+        BLOCK_N = 64 if arch.name == "gfx1100" else 32
+        return [
+            triton.Config(
+                {"BLOCK_M": 128, "BLOCK_N": BLOCK_N, "PRE_LOAD_V": False, "waves_per_eu": 6},
+                num_stages=1,
+                num_warps=8,
+            ),
+        ]
+    return [_fwd_cfg(64, 64, 2, False, stages=1, warps=4)]
+
+
 def get_fwd_prefill_configs(mode: AutotuneMode):
-    # NOTE: Tests expect specific BLOCK_N sizes for attention score renormalization:
-    #   - CDNA: BLOCK_N=64
-    #   - RDNA: BLOCK_N=32
-    # See _get_block_size_n_triton() in test_flash_attn_triton_amd.py
-
     if mode == "off":
-        if FWD_CONF_OVERRIDE:
-            return [FWD_CONF_OVERRIDE]
-        arch = get_arch()
-        if arch.name == "gfx950" or arch.name == "gfx942":
-            return [
-                _fwd_cfg(128, 64, 2, False, stages=1, warps=4),
-            ]
-        elif arch.is_rdna:
-            # gfx1151 (Strix Halo / RDNA3.5): tuned for the Qwen3-Omni
-            # ViT prefill shape (B=1, S=3200, H=16, head_dim=72, fp16).
-            if arch.name == "gfx1151":
-                return [
-                    _fwd_cfg(128, 64, 2, False, stages=1, warps=8),
-                ]
-            BLOCK_N = 64 if arch.name == "gfx1100" else 32
-            return [
-                triton.Config(
-                    {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": BLOCK_N,
-                        "PRE_LOAD_V": False,
-                        "waves_per_eu": 6,
-                    },
-                    num_stages=1,
-                    num_warps=8,
-                ),
-            ]
-        else:
-            return [
-                _fwd_cfg(64, 64, 2, False, stages=1, warps=4)
-            ]
-
+        return _fwd_configs_full(get_arch())[:1]
     elif mode == "on":
-        if FWD_CONF_OVERRIDE:
-            return [FWD_CONF_OVERRIDE]
-        arch = get_arch()
-        if arch.name == "gfx950":
-            return [
-                _fwd_cfg(128, 64, 2, False, stages=1, warps=4),
-                _fwd_cfg(128, 64, 2, False, stages=1, warps=2),
-                _fwd_cfg(128, 64, 2, False, stages=2, warps=4),
-                _fwd_cfg(128, 128, 2, False, stages=2, warps=4),
-            ]
-        elif arch.name == "gfx942":
-            if arch.cu_count < 304:
-                return [
-                    _fwd_cfg(128, 64, 2, False, stages=1, warps=4),
-                ]
-            else:
-                return [
-                    _fwd_cfg(128, 64, 2, False, stages=1, warps=4)
-                ]
-        elif arch.is_rdna:
-            # gfx1151 (Strix Halo / RDNA3.5): tuned for the Qwen3-Omni
-            # ViT prefill shape (B=1, S=3200, H=16, head_dim=72, fp16).
-            if arch.name == "gfx1151":
-                return [
-                    _fwd_cfg(128, 64, 2, False, stages=1, warps=8),
-                ]
-            BLOCK_N = 64 if arch.name == "gfx1100" else 32
-            return [
-                triton.Config(
-                    {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": BLOCK_N,
-                        "PRE_LOAD_V": False,
-                        "waves_per_eu": 6,
-                    },
-                    num_stages=1,
-                    num_warps=8,
-                ),
-            ]
-        else:
-            return [
-                _fwd_cfg(64, 64, 2, False, stages=1, warps=4)
-            ]
-
+        return _fwd_configs_full(get_arch())
     else:  # sweep
         configs = []
         BLOCK_M_OPTIONS = [128, 64, 32, 16]
